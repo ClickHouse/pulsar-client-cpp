@@ -157,7 +157,7 @@ class ClientImpl : public std::enable_shared_from_this<ClientImpl> {
     void handleConsumerCreated(Result result, ConsumerImplBaseWeakPtr consumerWeakPtr,
                                SubscribeCallback callback, ConsumerImplBasePtr consumer);
 
-    typedef std::shared_ptr<int> SharedInt;
+    typedef std::shared_ptr<std::atomic<int>> SharedInt;
 
     void handleClose(Result result, SharedInt remaining, ResultCallback callback);
 
