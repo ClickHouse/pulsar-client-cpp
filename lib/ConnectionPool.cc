@@ -82,6 +82,18 @@ Future<Result, ClientConnectionWeakPtr> ConnectionPool::getConnectionAsync(const
         return promise.getFuture();
     }
 
+    // Every physical connection goes through this pool, including connections to brokers that were
+    // not listed in the service URL but discovered through lookup responses, so this is the single
+    // place where an application-provided validator can constrain the set of reachable hosts.
+    const auto& validator = clientConfiguration_.getConnectionValidator();
+    if (validator && !validator(physicalAddress)) {
+        LOG_ERROR("Rejected connection to " << physicalAddress
+                                            << ": the address is not allowed by the connection validator");
+        Promise<Result, ClientConnectionWeakPtr> promise;
+        promise.setFailed(ResultConnectError);
+        return promise.getFuture();
+    }
+
     std::unique_lock<std::recursive_mutex> lock(mutex_);
 
     auto key = getKey(logicalAddress, physicalAddress, keySuffix);

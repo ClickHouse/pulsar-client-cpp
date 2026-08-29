@@ -23,6 +23,8 @@
 #include <pulsar/Logger.h>
 #include <pulsar/defines.h>
 
+#include <functional>
+
 namespace pulsar {
 class PulsarWrapper;
 struct ClientConfigurationImpl;
@@ -186,6 +188,29 @@ class PULSAR_PUBLIC ClientConfiguration {
      * will be cleaned up.
      */
     ClientConfiguration& setLogger(LoggerFactory* loggerFactory);
+
+    /**
+     * A callback invoked with the physical address of every broker the client is about to open
+     * a TCP connection to (e.g. "pulsar://broker-1.example.com:6650"), including brokers
+     * discovered through lookup responses rather than listed in the service URL. When the
+     * callback returns false the connection attempt is rejected with ResultConnectError.
+     *
+     * The callback must be thread-safe: it can be invoked concurrently from client executor
+     * threads. By default no validator is set and all connections are allowed.
+     */
+    using ConnectionValidator = std::function<bool(const std::string& physicalAddress)>;
+
+    /**
+     * Set the validator invoked before every broker connection attempt.
+     *
+     * @param validator the connection validator callback
+     */
+    ClientConfiguration& setConnectionValidator(ConnectionValidator validator);
+
+    /**
+     * @return the connection validator callback, or an empty function if none was set
+     */
+    const ConnectionValidator& getConnectionValidator() const;
 
     /**
      * Configure whether to use the TLS encryption on the connections.
