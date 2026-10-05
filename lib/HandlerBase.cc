@@ -63,6 +63,7 @@ void HandlerBase::start() {
     creationTimer_->async_wait([this, weakSelf](const ASIO_ERROR& error) {
         auto self = weakSelf.lock();
         if (self && !error) {
+            LOG_WARN(getName() << "Cancel the pending reconnection due to the start timeout");
             connectionFailed(ResultTimeout);
             ASIO_ERROR ignored;
             timer_->cancel(ignored);
@@ -124,7 +125,11 @@ void HandlerBase::grabCnx(const boost::optional<std::string>& assignedBrokerUrl)
             connectionOpened(cnx).addListener([this, self](Result result, bool) {
                 // Do not use bool, only Result.
                 reconnectionPending_ = false;
-                if (result != ResultOk && isResultRetryable(result)) {
+                if (result == ResultOk) {
+                    // Prevent the creationTimer_ from cancelling the timer_ in future
+                    ASIO_ERROR ignored;
+                    creationTimer_->cancel(ignored);
+                } else if (isResultRetryable(result)) {
                     scheduleReconnection();
                 }
             });
