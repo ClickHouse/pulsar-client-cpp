@@ -87,7 +87,11 @@ class PULSAR_PUBLIC ConnectionPool {
         return getConnectionAsync(address, address);
     }
 
-    size_t generateRandomIndex() { return randomDistribution_(randomEngine_); }
+    size_t generateRandomIndex() {
+        // Handlers are created concurrently from the caller and executor threads.
+        std::lock_guard<std::mutex> lock(randomMutex_);
+        return randomDistribution_(randomEngine_);
+    }
 
    private:
     ClientConfiguration clientConfiguration_;
@@ -101,6 +105,7 @@ class PULSAR_PUBLIC ConnectionPool {
 
     std::uniform_int_distribution<> randomDistribution_;
     std::mt19937 randomEngine_;
+    std::mutex randomMutex_;
 
     friend class PulsarFriend;
 };
