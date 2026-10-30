@@ -37,10 +37,18 @@ SharedBuffer CompressionCodecSnappy::encode(const SharedBuffer& raw) {
 
 bool CompressionCodecSnappy::decode(const SharedBuffer& encoded, uint32_t uncompressedSize,
                                     SharedBuffer& decoded) {
+    // The length recorded inside the Snappy stream is independent from the one in the message metadata.
+    // Both come from the network, so they must agree before decompressing into a buffer of
+    // `uncompressedSize` bytes, otherwise a malformed message would overflow it.
+    size_t streamUncompressedSize = 0;
+    if (!snappy::GetUncompressedLength(encoded.data(), encoded.readableBytes(), &streamUncompressedSize) ||
+        streamUncompressedSize != uncompressedSize) {
+        return false;
+    }
+
     SharedBuffer uncompressed = SharedBuffer::allocate(uncompressedSize);
-    snappy::ByteArraySource source(encoded.data(), encoded.readableBytes());
-    snappy::UncheckedByteArraySink sink(uncompressed.mutableData());
-    if (snappy::Uncompress(&source, &sink)) {
+    // `RawUncompress` never writes more than the length recorded in the stream, which is checked above.
+    if (snappy::RawUncompress(encoded.data(), encoded.readableBytes(), uncompressed.mutableData())) {
         decoded = uncompressed;
         decoded.setWriterIndex(uncompressedSize);
         return true;

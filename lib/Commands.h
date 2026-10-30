@@ -151,6 +151,9 @@ class Commands {
     static uint64_t serializeSingleMessagesToBatchPayload(SharedBuffer& batchPayload,
                                                           const std::vector<Message>& messages);
 
+    // Checks that `batchPayload` contains `batchSize` complete single messages with parseable metadata.
+    static bool isValidBatchPayload(const SharedBuffer& batchPayload, int32_t batchSize);
+
     static Message deSerializeSingleMessageInBatch(Message& batchedMessage, int32_t batchIndex,
                                                    int32_t batchSize, const BatchMessageAckerPtr& acker);
 

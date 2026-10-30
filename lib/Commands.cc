@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <stdexcept>
 
 #include "BatchMessageAcker.h"
 #include "BatchedMessageIdImpl.h"
@@ -897,6 +898,34 @@ uint64_t Commands::serializeSingleMessagesToBatchPayload(SharedBuffer& batchPayl
     return messages.back().impl_->metadata.sequence_id();
 }
 
+bool Commands::isValidBatchPayload(const SharedBuffer& batchPayload, int32_t batchSize) {
+    if (batchSize < 0) {
+        return false;
+    }
+    // Work on a copy, so the read index of the original buffer is not changed.
+    SharedBuffer buffer(batchPayload);
+    for (int32_t i = 0; i < batchSize; i++) {
+        if (buffer.readableBytes() < sizeof(uint32_t)) {
+            return false;
+        }
+        const uint32_t singleMetaSize = buffer.readUnsignedInt();
+        if (singleMetaSize > buffer.readableBytes()) {
+            return false;
+        }
+        SingleMessageMetadata metadata;
+        if (!metadata.ParseFromArray(buffer.data(), static_cast<int>(singleMetaSize))) {
+            return false;
+        }
+        buffer.consume(singleMetaSize);
+        if (metadata.payload_size() < 0 ||
+            static_cast<uint32_t>(metadata.payload_size()) > buffer.readableBytes()) {
+            return false;
+        }
+        buffer.consume(static_cast<uint32_t>(metadata.payload_size()));
+    }
+    return true;
+}
+
 Message Commands::deSerializeSingleMessageInBatch(Message& batchedMessage, int32_t batchIndex,
                                                   int32_t batchSize, const BatchMessageAckerPtr& acker) {
     SharedBuffer& uncompressedPayload = batchedMessage.impl_->payload;
@@ -904,12 +933,26 @@ Message Commands::deSerializeSingleMessageInBatch(Message& batchedMessage, int32
     // Format of batch message
     // Each Message = [METADATA_SIZE][METADATA] [PAYLOAD]
 
-    const int& singleMetaSize = uncompressedPayload.readUnsignedInt();
+    // The batch comes from the network, and the bounds checks of `SharedBuffer` are only assertions,
+    // so every length is validated here to never read past the received data.
+    if (uncompressedPayload.readableBytes() < sizeof(uint32_t)) {
+        throw std::runtime_error("Truncated batch message: no space for the metadata size");
+    }
+    const uint32_t singleMetaSize = uncompressedPayload.readUnsignedInt();
+    if (singleMetaSize > uncompressedPayload.readableBytes()) {
+        throw std::runtime_error("Truncated batch message: the metadata size exceeds the remaining payload");
+    }
     SingleMessageMetadata metadata;
-    metadata.ParseFromArray(uncompressedPayload.data(), singleMetaSize);
+    if (!metadata.ParseFromArray(uncompressedPayload.data(), static_cast<int>(singleMetaSize))) {
+        throw std::runtime_error("Corrupted batch message: cannot parse the single message metadata");
+    }
     uncompressedPayload.consume(singleMetaSize);
 
-    const int& payloadSize = metadata.payload_size();
+    if (metadata.payload_size() < 0 ||
+        static_cast<uint32_t>(metadata.payload_size()) > uncompressedPayload.readableBytes()) {
+        throw std::runtime_error("Truncated batch message: the payload size exceeds the remaining payload");
+    }
+    const uint32_t payloadSize = static_cast<uint32_t>(metadata.payload_size());
 
     // Get a slice of size payloadSize from offset readIndex_
     SharedBuffer payload = uncompressedPayload.slice(0, payloadSize);

@@ -573,6 +573,13 @@ void ConsumerImpl::messageReceived(const ClientConnectionPtr& cnx, const proto::
     }
 
     if (metadata.has_num_messages_in_batch()) {
+        // Reject a malformed batch before constructing any message from it.
+        if (!Commands::isValidBatchPayload(m.impl_->payload, metadata.num_messages_in_batch())) {
+            LOG_ERROR(getName() << "Got corrupted batch message with " << metadata.num_messages_in_batch()
+                                << " messages and payload size " << m.impl_->payload.readableBytes());
+            discardCorruptedMessage(cnx, msg.message_id(), CommandAck_ValidationError_BatchDeSerializeError);
+            return;
+        }
         BitSet::Data words(msg.ack_set_size());
         for (int i = 0; i < words.size(); i++) {
             words[i] = msg.ack_set(i);
