@@ -170,6 +170,11 @@ class ConsumerImpl : public ConsumerImplBase {
     ConsumerStatsBasePtr consumerStatsBasePtr_;
 
    private:
+    // The maximum size of a message after decompression or the reassembly of its chunks. The sizes are
+    // declared by the producer in the message metadata, and the buffers are allocated before the data is
+    // decoded, so the limit protects the consumer from a tiny message that declares a huge size.
+    static constexpr uint32_t MaxUncompressedMessageSize = 256 * 1024 * 1024;
+
     std::atomic_bool waitingForZeroQueueSizeMessage;
     std::shared_ptr<ConsumerImpl> get_shared_this_ptr();
     bool uncompressMessageIfNeeded(const ClientConnectionPtr& cnx, const proto::MessageIdData& messageIdData,
