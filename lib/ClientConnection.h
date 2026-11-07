@@ -196,6 +196,11 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
 
     static int32_t getMaxMessageSize();
 
+    // The maximum size of a frame received from the broker, validated before a buffer for it is allocated.
+    static uint32_t getMaxFrameSize();
+    static constexpr int64_t MaxAllowedMessageSize = 256 * 1024 * 1024;
+    static constexpr int64_t MessageSizeFramePadding = 10 * 1024;
+
     Commands::ChecksumType getChecksumType() const;
 
     Future<Result, BrokerConsumerStatsImpl> newConsumerStats(uint64_t consumerId, uint64_t requestId);

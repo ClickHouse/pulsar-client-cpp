@@ -693,6 +693,16 @@ void ClientConnection::processIncomingBuffer() {
         // At this point we have at least 4 bytes in the buffer
         uint32_t frameSize = incomingBuffer_.readUnsignedInt();
 
+        // The frame size comes from the network: validate it before allocating a buffer for the frame,
+        // otherwise four bytes advertising a 4 GiB frame would make the client allocate 4 GiB.
+        // A frame contains at least the size of the command.
+        if (frameSize < sizeof(uint32_t) || frameSize > getMaxFrameSize()) {
+            LOG_ERROR(cnxString_ << "Received a frame of invalid size " << frameSize << " (the limit is "
+                                 << getMaxFrameSize() << ")");
+            close(ResultDisconnected);
+            return;
+        }
+
         if (frameSize > incomingBuffer_.readableBytes()) {
             // We don't have the entire frame yet
             const uint32_t bytesToReceive = frameSize - incomingBuffer_.readableBytes();
@@ -704,7 +714,15 @@ void ClientConnection::processIncomingBuffer() {
             if (bytesToReceive > incomingBuffer_.writableBytes()) {
                 // Need to allocate a buffer big enough for the frame
                 uint32_t newBufferSize = std::max<uint32_t>(DefaultBufferSize, frameSize + sizeof(uint32_t));
-                incomingBuffer_ = SharedBuffer::copyFrom(incomingBuffer_, newBufferSize);
+                try {
+                    incomingBuffer_ = SharedBuffer::copyFrom(incomingBuffer_, newBufferSize);
+                } catch (const std::exception& e) {
+                    // An allocation failure must not escape the executor thread.
+                    LOG_ERROR(cnxString_ << "Failed to allocate a buffer of " << newBufferSize
+                                         << " bytes for an incoming frame: " << e.what());
+                    close(ResultDisconnected);
+                    return;
+                }
             }
             auto self = shared_from_this();
             asyncReceive(incomingBuffer_.asio_buffer(),
@@ -715,8 +733,22 @@ void ClientConnection::processIncomingBuffer() {
             return;
         }
 
-        // At this point,  we have at least one complete frame available in the buffer
+        // At this point,  we have at least one complete frame available in the buffer.
+        // Every length embedded into the frame is validated against the rest of the frame before it is
+        // used, so that a malformed frame can not make the parser read beyond it.
+        auto closeOnMalformedFrame = [this](const char* reason) {
+            LOG_ERROR(cnxString_ << "Received a malformed frame: " << reason);
+            close(ResultDisconnected);
+        };
+
         uint32_t cmdSize = incomingBuffer_.readUnsignedInt();
+        if (cmdSize > frameSize - sizeof(uint32_t)) {
+            closeOnMalformedFrame("the command is bigger than the frame");
+            return;
+        }
+        // The bytes of the frame after the command.
+        uint32_t remainingBytes = frameSize - sizeof(uint32_t) - cmdSize;
+
         proto::BaseCommand incomingCmd;
         if (!incomingCmd.ParseFromArray(incomingBuffer_.data(), cmdSize)) {
             LOG_ERROR(cnxString_ << "Error parsing protocol buffer command");
@@ -731,13 +763,24 @@ void ClientConnection::processIncomingBuffer() {
             proto::MessageMetadata msgMetadata;
             proto::BrokerEntryMetadata brokerEntryMetadata;
 
-            // read checksum
-            uint32_t remainingBytes = frameSize - (cmdSize + 4);
+            // A message has at least the magic number (or the size of the metadata) after the command.
+            if (remainingBytes < sizeof(uint16_t)) {
+                closeOnMalformedFrame("the message is truncated");
+                return;
+            }
 
             auto readerIndex = incomingBuffer_.readerIndex();
             if (incomingBuffer_.readUnsignedShort() == Commands::magicBrokerEntryMetadata) {
                 // broker entry metadata is present
+                if (remainingBytes < 2 + 4) {
+                    closeOnMalformedFrame("the broker entry metadata is truncated");
+                    return;
+                }
                 uint32_t brokerEntryMetadataSize = incomingBuffer_.readUnsignedInt();
+                if (brokerEntryMetadataSize > remainingBytes - (2 + 4)) {
+                    closeOnMalformedFrame("the broker entry metadata is bigger than the frame");
+                    return;
+                }
                 if (!brokerEntryMetadata.ParseFromArray(incomingBuffer_.data(), brokerEntryMetadataSize)) {
                     LOG_ERROR(cnxString_ << "[consumer id " << incomingCmd.message().consumer_id()
                                          << ", message ledger id "
@@ -753,9 +796,28 @@ void ClientConnection::processIncomingBuffer() {
                 incomingBuffer_.setReaderIndex(readerIndex);
             }
 
+            // The checksum (if any) is followed by the size of the metadata.
+            if (remainingBytes < sizeof(uint16_t)) {
+                closeOnMalformedFrame("the message is truncated");
+                return;
+            }
+            if (remainingBytes < 2 + 4 + 4 && incomingBuffer_.readableBytes() >= sizeof(uint16_t) &&
+                ntohs(*reinterpret_cast<const uint16_t*>(incomingBuffer_.data())) == Commands::magicCrc32c) {
+                closeOnMalformedFrame("the checksum of the message is truncated");
+                return;
+            }
+
             bool isChecksumValid = verifyChecksum(incomingBuffer_, remainingBytes, incomingCmd);
 
+            if (remainingBytes < 4) {
+                closeOnMalformedFrame("the size of the message metadata is truncated");
+                return;
+            }
             uint32_t metadataSize = incomingBuffer_.readUnsignedInt();
+            if (metadataSize > remainingBytes - 4) {
+                closeOnMalformedFrame("the message metadata is bigger than the frame");
+                return;
+            }
             if (!msgMetadata.ParseFromArray(incomingBuffer_.data(), metadataSize)) {
                 LOG_ERROR(cnxString_ << "[consumer id " << incomingCmd.message().consumer_id()  //
                                      << ", message ledger id "
@@ -775,6 +837,8 @@ void ClientConnection::processIncomingBuffer() {
             handleIncomingMessage(incomingCmd.message(), isChecksumValid, brokerEntryMetadata, msgMetadata,
                                   payload);
         } else {
+            // Skip the rest of the frame, if any, so that it is not parsed as the next frame.
+            incomingBuffer_.consume(remainingBytes);
             handleIncomingCommand(incomingCmd);
         }
     }
@@ -1397,6 +1461,13 @@ const std::string& ClientConnection::cnxString() const { return cnxString_; }
 int ClientConnection::getServerProtocolVersion() const { return serverProtocolVersion_; }
 
 int32_t ClientConnection::getMaxMessageSize() { return maxMessageSize_.load(std::memory_order_acquire); }
+
+uint32_t ClientConnection::getMaxFrameSize() {
+    // Like the Java client, allow the maximum message size negotiated with the broker plus padding for the
+    // command and the metadata. The maximum message size comes from the broker too, so it is bounded.
+    const int64_t maxMessageSize = std::max<int64_t>(getMaxMessageSize(), Commands::MaxFrameSize);
+    return static_cast<uint32_t>(std::min<int64_t>(maxMessageSize, MaxAllowedMessageSize) + MessageSizeFramePadding);
+}
 
 Commands::ChecksumType ClientConnection::getChecksumType() const {
     return getServerProtocolVersion() >= proto::v6 ? Commands::Crc32c : Commands::None;
