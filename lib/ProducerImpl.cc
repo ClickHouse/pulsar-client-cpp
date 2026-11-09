@@ -147,6 +147,7 @@ Future<Result, bool> ProducerImpl::connectionOpened(const ClientConnectionPtr& c
     LOG_INFO("Creating producer for topic:" << topic() << ", producerName:" << producerName_ << " on "
                                             << cnx->cnxString());
     ClientImplPtr client = client_.lock();
+    maxMessageSize_.store(cnx->getMaxMessageSize(), std::memory_order_release);
     cnx->registerProducer(producerId_, shared_from_this());
 
     long requestId = client->newRequestId();
@@ -521,7 +522,7 @@ void ProducerImpl::sendAsyncWithStatsUpdate(const Message& msg, SendCallback&& c
     const auto payload =
         compressed ? applyCompression(uncompressedPayload, conf_.getCompressionType()) : uncompressedPayload;
     const auto compressedSize = static_cast<uint32_t>(payload.readableBytes());
-    const auto maxMessageSize = static_cast<uint32_t>(ClientConnection::getMaxMessageSize());
+    const auto maxMessageSize = static_cast<uint32_t>(maxMessageSize_.load(std::memory_order_acquire));
 
     if (!msgMetadata.has_replicated_from() && msgMetadata.has_producer_name()) {
         handleFailedResult(ResultInvalidMessage);

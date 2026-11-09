@@ -44,7 +44,8 @@ void MessageAndCallbackBatch::add(const Message& msg, const SendCallback& callba
 }
 
 std::unique_ptr<OpSendMsg> MessageAndCallbackBatch::createOpSendMsg(
-    uint64_t producerId, const ProducerConfiguration& producerConfig, MessageCrypto* crypto) {
+    uint64_t producerId, const ProducerConfiguration& producerConfig, MessageCrypto* crypto,
+    int32_t maxMessageSize) {
     auto callback = createSendCallback();
     if (empty()) {
         return OpSendMsg::create(ResultOperationNotSupported, std::move(callback));
@@ -71,7 +72,7 @@ std::unique_ptr<OpSendMsg> MessageAndCallbackBatch::createOpSendMsg(
         payload = encryptedPayload;
     }
 
-    if (payload.readableBytes() > ClientConnection::getMaxMessageSize()) {
+    if (payload.readableBytes() > static_cast<uint32_t>(maxMessageSize)) {
         return OpSendMsg::create(ResultMessageTooBig, std::move(callback));
     }
 

@@ -31,6 +31,7 @@ BatchMessageContainerBase::BatchMessageContainerBase(const ProducerImpl& produce
       producerConfig_(producer.conf_),
       producerName_(producer.producerName_),
       producerId_(producer.producerId_),
+      maxMessageSize_(producer.maxMessageSize_),
       msgCryptoWeakPtr_(producer.msgCrypto_) {}
 
 BatchMessageContainerBase::~BatchMessageContainerBase() {}
@@ -38,7 +39,8 @@ BatchMessageContainerBase::~BatchMessageContainerBase() {}
 std::unique_ptr<OpSendMsg> BatchMessageContainerBase::createOpSendMsgHelper(
     MessageAndCallbackBatch& batch) const {
     auto crypto = msgCryptoWeakPtr_.lock();
-    return batch.createOpSendMsg(producerId_, producerConfig_, crypto.get());
+    return batch.createOpSendMsg(producerId_, producerConfig_, crypto.get(),
+                                 maxMessageSize_.load(std::memory_order_acquire));
 }
 
 }  // namespace pulsar

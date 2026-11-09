@@ -56,7 +56,7 @@ class MessageAndCallbackBatch final : public boost::noncopyable {
 
     std::unique_ptr<OpSendMsg> createOpSendMsg(uint64_t producerId,
                                                const ProducerConfiguration& producerConfig,
-                                               MessageCrypto* crypto);
+                                               MessageCrypto* crypto, int32_t maxMessageSize);
 
     void clear();
 

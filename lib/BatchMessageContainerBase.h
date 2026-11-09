@@ -24,6 +24,7 @@
 #include <pulsar/ProducerConfiguration.h>
 #include <pulsar/Result.h>
 
+#include <atomic>
 #include <boost/noncopyable.hpp>
 #include <memory>
 #include <stdexcept>
@@ -94,6 +95,7 @@ class BatchMessageContainerBase : public boost::noncopyable {
     const ProducerConfiguration& producerConfig_;
     const std::string& producerName_;
     const uint64_t& producerId_;
+    const std::atomic<int32_t>& maxMessageSize_;
     const std::weak_ptr<MessageCrypto> msgCryptoWeakPtr_;
 
     unsigned int getMaxNumMessages() const noexcept { return producerConfig_.getBatchingMaxMessages(); }

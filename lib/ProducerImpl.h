@@ -37,6 +37,7 @@
 #include "OpSendMsg.h"
 #endif
 #include "AsioDefines.h"
+#include "Commands.h"
 #include "PendingFailures.h"
 #include "PeriodicTask.h"
 #include "ProducerImplBase.h"
@@ -181,6 +182,9 @@ class ProducerImpl : public HandlerBase, public ProducerImplBase {
     bool userProvidedProducerName_;
     std::string producerStr_;
     uint64_t producerId_;
+
+    // The maximum message size negotiated with the broker of the current connection of this producer.
+    std::atomic<int32_t> maxMessageSize_{Commands::DefaultMaxMessageSize};
 
     std::unique_ptr<BatchMessageContainerBase> batchMessageContainer_;
     DeadlineTimerPtr batchTimer_;

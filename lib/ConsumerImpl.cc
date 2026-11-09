@@ -437,6 +437,13 @@ void ConsumerImpl::triggerCheckExpiredChunkedTimer() {
     });
 }
 
+bool ConsumerImpl::isValidChunkedMessageLayout(int64_t numChunks, int64_t totalChunkMsgSize,
+                                               int64_t maxMessageSize) noexcept {
+    return numChunks > 0 && totalChunkMsgSize > 0 && numChunks <= totalChunkMsgSize &&
+           totalChunkMsgSize <= static_cast<int64_t>(MaxUncompressedMessageSize) &&
+           totalChunkMsgSize <= numChunks * maxMessageSize;
+}
+
 boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuffer& payload,
                                                                 const proto::MessageMetadata& metadata,
                                                                 const proto::MessageIdData& messageIdData,
@@ -478,13 +485,25 @@ boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuff
         return boost::none;
     };
 
+    // The buffer of the assembled message is allocated from the size declared by the producer, and the
+    // memory may be exhausted. The exception must not escape the IO thread of the connection. Do not
+    // acknowledge the chunks, because the message is valid: close the connection instead, so that the
+    // unacknowledged messages are redelivered after the consumer reconnects.
+    auto handleAllocationFailure = [&](const std::exception& e) {
+        LOG_ERROR(getName() << "Failed to allocate memory for a chunked message (uuid: " << uuid
+                            << ", chunkId: " << chunkId << ", totalChunkMsgSize: "
+                            << metadata.total_chunk_msg_size() << ", messageId: " << messageId
+                            << "): " << e.what());
+        chunkedMessageCache_.remove(uuid);
+        lock.unlock();
+        cnx->close(ResultDisconnected);
+        return boost::none;
+    };
+
     if (chunkId == 0 && it == chunkedMessageCache_.end()) {
-        const int64_t numChunks = metadata.num_chunks_from_msg();
-        const int64_t totalChunkMsgSize = metadata.total_chunk_msg_size();
-        const int64_t maxMessageSize = ClientConnection::getMaxMessageSize();
-        if (totalChunkMsgSize <= 0 || totalChunkMsgSize > numChunks * maxMessageSize ||
-            totalChunkMsgSize > static_cast<int64_t>(MaxUncompressedMessageSize)) {
-            return discardMalformedChunk("invalid total size of the chunked message");
+        if (!isValidChunkedMessageLayout(metadata.num_chunks_from_msg(), metadata.total_chunk_msg_size(),
+                                         cnx->getMaxMessageSize())) {
+            return discardMalformedChunk("invalid number of chunks or total size of the chunked message");
         }
 
         if (maxPendingChunkedMessage_ > 0 && chunkedMessageCache_.size() >= maxPendingChunkedMessage_) {
@@ -496,8 +515,12 @@ boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuff
                     }
                 });
         }
-        it = chunkedMessageCache_.putIfAbsent(
-            uuid, ChunkedMessageCtx{metadata.num_chunks_from_msg(), metadata.total_chunk_msg_size()});
+        try {
+            it = chunkedMessageCache_.putIfAbsent(
+                uuid, ChunkedMessageCtx{metadata.num_chunks_from_msg(), metadata.total_chunk_msg_size()});
+        } catch (const std::exception& e) {
+            return handleAllocationFailure(e);
+        }
     }
 
     auto& chunkedMsgCtx = it->second;
@@ -520,7 +543,11 @@ boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuff
         return discardMalformedChunk("the chunks are bigger than the total size of the chunked message");
     }
 
-    chunkedMsgCtx.appendChunk(messageId, payload);
+    try {
+        chunkedMsgCtx.appendChunk(messageId, payload);
+    } catch (const std::exception& e) {
+        return handleAllocationFailure(e);
+    }
     if (!chunkedMsgCtx.isCompleted()) {
         lock.unlock();
         increaseAvailablePermits(cnx);
@@ -875,7 +902,7 @@ bool ConsumerImpl::uncompressMessageIfNeeded(const ClientConnectionPtr& cnx,
     uint32_t uncompressedSize = metadata.uncompressed_size();
     uint32_t payloadSize = payload.readableBytes();
     if (cnx) {
-        if (checkMaxMessageSize && payloadSize > ClientConnection::getMaxMessageSize()) {
+        if (checkMaxMessageSize && payloadSize > cnx->getMaxMessageSize()) {
             // Uncompressed size is itself corrupted since it cannot be bigger than the MaxMessageSize
             LOG_ERROR(getName() << "Got corrupted payload message size " << payloadSize  //
                                 << " at  " << messageIdData.ledgerid() << ":" << messageIdData.entryid());

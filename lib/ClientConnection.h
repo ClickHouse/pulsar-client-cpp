@@ -194,10 +194,12 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
 
     int getServerProtocolVersion() const;
 
-    static int32_t getMaxMessageSize();
+    // The maximum message size negotiated with the broker of this connection. Different brokers may
+    // advertise different limits, so it is not shared between connections.
+    int32_t getMaxMessageSize() const;
 
     // The maximum size of a frame received from the broker, validated before a buffer for it is allocated.
-    static uint32_t getMaxFrameSize();
+    uint32_t getMaxFrameSize() const;
     static constexpr int64_t MaxAllowedMessageSize = 256 * 1024 * 1024;
     static constexpr int64_t MessageSizeFramePadding = 10 * 1024;
 
@@ -318,7 +320,7 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
     TimeDuration operationsTimeout_;
     AuthenticationPtr authentication_;
     int serverProtocolVersion_;
-    static std::atomic<int32_t> maxMessageSize_;
+    std::atomic<int32_t> maxMessageSize_{Commands::DefaultMaxMessageSize};
 
     ExecutorServicePtr executor_;
 

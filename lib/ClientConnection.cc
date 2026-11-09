@@ -158,8 +158,6 @@ static bool file_exists(const std::string& path) {
     return f.good();
 }
 
-std::atomic<int32_t> ClientConnection::maxMessageSize_{Commands::DefaultMaxMessageSize};
-
 ClientConnection::ClientConnection(const std::string& logicalAddress, const std::string& physicalAddress,
                                    ExecutorServicePtr executor,
                                    const ClientConfiguration& clientConfiguration,
@@ -1460,9 +1458,9 @@ const std::string& ClientConnection::cnxString() const { return cnxString_; }
 
 int ClientConnection::getServerProtocolVersion() const { return serverProtocolVersion_; }
 
-int32_t ClientConnection::getMaxMessageSize() { return maxMessageSize_.load(std::memory_order_acquire); }
+int32_t ClientConnection::getMaxMessageSize() const { return maxMessageSize_.load(std::memory_order_acquire); }
 
-uint32_t ClientConnection::getMaxFrameSize() {
+uint32_t ClientConnection::getMaxFrameSize() const {
     // Like the Java client, allow the maximum message size negotiated with the broker plus padding for the
     // command and the metadata. The maximum message size comes from the broker too, so it is bounded.
     const int64_t maxMessageSize = std::max<int64_t>(getMaxMessageSize(), Commands::MaxFrameSize);
