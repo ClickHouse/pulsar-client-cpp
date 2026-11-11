@@ -18,6 +18,8 @@
  */
 #include <gtest/gtest.h>
 
+#include <new>
+
 #include "lib/MapCache.h"
 
 using namespace pulsar;
@@ -106,4 +108,42 @@ TEST(MapCacheTest, testRemoveOldestValuesIf) {
     expireTime = 400;
     cache.removeOldestValuesIf(checkCondition);
     ASSERT_EQ(cache.size(), 0);
+}
+
+struct ThrowOnMove {
+    static bool throwOnMove;
+    int x = 0;
+
+    ThrowOnMove() = default;
+    ThrowOnMove(int xx) : x(xx) {}
+    ThrowOnMove(const ThrowOnMove&) = delete;
+    ThrowOnMove(ThrowOnMove&& rhs) : x(rhs.x) {
+        if (throwOnMove) {
+            throw std::bad_alloc();
+        }
+    }
+};
+
+bool ThrowOnMove::throwOnMove = false;
+
+TEST(MapCacheTest, testPutIfAbsentRollsBackKeyOnFailure) {
+    MapCache<int, ThrowOnMove> cache;
+    cache.putIfAbsent(1, {100});
+
+    ThrowOnMove::throwOnMove = true;
+    ASSERT_THROW(cache.putIfAbsent(2, {200}), std::bad_alloc);
+    ThrowOnMove::throwOnMove = false;
+
+    ASSERT_EQ(cache.size(), 1);
+    ASSERT_EQ(cache.find(2), cache.end());
+    ASSERT_EQ(cache.getKeys(), (std::vector<int>{1}));
+
+    // The key can be inserted again after the failure.
+    ASSERT_NE(cache.putIfAbsent(2, {200}), cache.end());
+    ASSERT_EQ(cache.getKeys(), (std::vector<int>{1, 2}));
+
+    // The expiry walk terminates and removes all values.
+    cache.removeOldestValuesIf([](const int&, const ThrowOnMove&) { return true; });
+    ASSERT_EQ(cache.size(), 0);
+    ASSERT_TRUE(cache.getKeys().empty());
 }

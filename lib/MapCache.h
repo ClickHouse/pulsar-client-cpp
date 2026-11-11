@@ -50,11 +50,17 @@ class MapCache {
 
     iterator putIfAbsent(const Key& key, Value&& value) {
         auto it = map_.find(key);
-        if (it == map_.end()) {
-            keys_.push_back(key);
-            return map_.emplace(key, std::move(value)).first;
-        } else {
+        if (it != map_.end()) {
             return end();
+        }
+        keys_.push_back(key);
+        // Roll back the key if the insertion throws (e.g. `std::bad_alloc`), otherwise the orphan key would
+        // never be removed and `removeOldestValuesIf` could not advance past it.
+        try {
+            return map_.emplace(key, std::move(value)).first;
+        } catch (...) {
+            keys_.pop_back();
+            throw;
         }
     }
 
@@ -79,6 +85,8 @@ class MapCache {
             const auto key = keys_.front();
             auto it = map_.find(key);
             if (it == map_.end()) {
+                // An orphan key without a value: discard it, otherwise the loop would never terminate.
+                keys_.pop_front();
                 continue;
             }
             if (condition(it->first, it->second)) {
@@ -93,9 +101,9 @@ class MapCache {
     void remove(const Key& key) {
         auto it = map_.find(key);
         if (it != map_.end()) {
-            removeKeyFromKeys(key);
             map_.erase(it);
         }
+        removeKeyFromKeys(key);
     }
 
     // Following methods are only used for tests

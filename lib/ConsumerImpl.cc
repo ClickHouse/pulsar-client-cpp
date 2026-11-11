@@ -523,8 +523,9 @@ boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuff
         }
     }
 
-    auto& chunkedMsgCtx = it->second;
-    if (it == chunkedMessageCache_.end() || !chunkedMsgCtx.validateChunkId(chunkId)) {
+    // A chunk other than the first one may arrive when its first chunk is missing or already expired, so
+    // check for the end iterator before dereferencing it.
+    if (it == chunkedMessageCache_.end() || !it->second.validateChunkId(chunkId)) {
         if (it == chunkedMessageCache_.end()) {
             LOG_ERROR("Received an uncached chunk (uuid: " << uuid << " chunkId: " << chunkId
                                                            << ", messageId: " << messageId << ")");
@@ -539,6 +540,7 @@ boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuff
         return boost::none;
     }
 
+    auto& chunkedMsgCtx = it->second;
     if (payload.readableBytes() > chunkedMsgCtx.getBuffer().writableBytes()) {
         return discardMalformedChunk("the chunks are bigger than the total size of the chunked message");
     }
@@ -565,6 +567,8 @@ boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuff
 
     auto wholePayload = chunkedMsgCtx.getBuffer();
     chunkedMessageCache_.remove(uuid);
+    // The decompression may close the connection, which must not be done under the lock.
+    lock.unlock();
     if (uncompressMessageIfNeeded(cnx, messageIdData, metadata, wholePayload, false)) {
         return wholePayload;
     } else {
@@ -929,12 +933,13 @@ bool ConsumerImpl::uncompressMessageIfNeeded(const ClientConnectionPtr& cnx,
     try {
         decoded = CompressionCodecProvider::getCodec(compressionType).decode(payload, uncompressedSize, payload);
     } catch (const std::exception& e) {
-        // An allocation failure must not escape the executor thread of the client. The message is not
-        // corrupted, so it is not acknowledged: it is tracked to be redelivered like an undecryptable one.
+        // An allocation failure must not escape the IO thread of the connection. The message is valid, so
+        // it is not acknowledged. The unacknowledged message tracker is disabled by default, so tracking the
+        // message would not redeliver it: close the connection instead, so that the unacknowledged messages
+        // are redelivered after the consumer reconnects.
         LOG_ERROR(getName() << "Failed to decompress message with " << uncompressedSize << " at "
                             << messageIdData.ledgerid() << ":" << messageIdData.entryid() << ": " << e.what());
-        unAckedMessageTrackerPtr_->add(MessageIdBuilder::from(messageIdData).build());
-        increaseAvailablePermits(cnx);
+        cnx->close(ResultDisconnected);
         return false;
     }
 
