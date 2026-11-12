@@ -404,6 +404,16 @@ void ConsumerImpl::discardChunkMessages(std::string uuid, MessageId messageId, b
     }
 }
 
+void ConsumerImpl::rememberAbandonedChunkedMessage(const std::string& uuid, bool redeliver) {
+    abandonedChunkedMessages_.remove(uuid);
+    if (abandonedChunkedMessages_.size() >= MaxAbandonedChunkedMessages) {
+        abandonedChunkedMessages_.removeOldestValues(
+            abandonedChunkedMessages_.size() - MaxAbandonedChunkedMessages + 1,
+            [](const std::string&, const bool&) {});
+    }
+    abandonedChunkedMessages_.putIfAbsent(uuid, bool{redeliver});
+}
+
 void ConsumerImpl::triggerCheckExpiredChunkedTimer() {
     checkExpiredChunkedTimer_->expires_from_now(milliseconds(expireTimeOfIncompleteChunkedMessageMs_));
     std::weak_ptr<ConsumerImplBase> weakSelf{shared_from_this()};
@@ -430,6 +440,7 @@ void ConsumerImpl::triggerCheckExpiredChunkedTimer() {
                     LOG_INFO("Removing expired chunk messages: uuid: " << uuid << ", messageId: " << msgId);
                     discardChunkMessages(uuid, msgId, true);
                 }
+                rememberAbandonedChunkedMessage(uuid, false);
                 return true;
             });
         triggerCheckExpiredChunkedTimer();
@@ -480,6 +491,7 @@ boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuff
             }
             chunkedMessageCache_.remove(uuid);
         }
+        rememberAbandonedChunkedMessage(uuid, false);
         lock.unlock();
         discardCorruptedMessage(cnx, messageIdData, CommandAck_ValidationError_UncompressedSizeCorruption);
         return boost::none;
@@ -506,15 +518,32 @@ boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuff
             return discardMalformedChunk("invalid number of chunks or total size of the chunked message");
         }
 
+        // The chunks of the evicted messages are valid, but they are neither delivered nor acknowledged. The
+        // unacknowledged message tracker does not redeliver them: it is disabled by default and a consumer
+        // of a multi-topic consumer removes the messages from it. Request their redelivery explicitly, so
+        // that the evicted messages are not missing until the connection is closed for another reason.
+        std::set<MessageId> evictedChunks;
         if (maxPendingChunkedMessage_ > 0 && chunkedMessageCache_.size() >= maxPendingChunkedMessage_) {
             chunkedMessageCache_.removeOldestValues(
                 chunkedMessageCache_.size() - maxPendingChunkedMessage_ + 1,
-                [this](const std::string& uuid, const ChunkedMessageCtx& ctx) {
+                [this, &evictedChunks](const std::string& evictedUuid, const ChunkedMessageCtx& ctx) {
                     for (const MessageId& msgId : ctx.getChunkedMessageIds()) {
-                        discardChunkMessages(uuid, msgId, autoAckOldestChunkedMessageOnQueueFull_);
+                        if (autoAckOldestChunkedMessageOnQueueFull_) {
+                            discardChunkMessages(evictedUuid, msgId, true);
+                        } else {
+                            evictedChunks.insert(msgId);
+                        }
                     }
+                    rememberAbandonedChunkedMessage(evictedUuid, !autoAckOldestChunkedMessageOnQueueFull_);
                 });
         }
+        if (!evictedChunks.empty()) {
+            LOG_WARN(getName() << "Requesting redelivery of " << evictedChunks.size()
+                               << " chunks of the incomplete chunked messages evicted from the cache of "
+                               << maxPendingChunkedMessage_ << " pending chunked messages");
+            redeliverMessages(evictedChunks);
+        }
+        abandonedChunkedMessages_.remove(uuid);
         try {
             it = chunkedMessageCache_.putIfAbsent(
                 uuid, ChunkedMessageCtx{metadata.num_chunks_from_msg(), metadata.total_chunk_msg_size()});
@@ -523,20 +552,46 @@ boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuff
         }
     }
 
-    // A chunk other than the first one may arrive when its first chunk is missing or already expired, so
-    // check for the end iterator before dereferencing it.
+    // A chunk other than the first one may arrive when its first chunk is missing, evicted or already
+    // expired, so check for the end iterator before dereferencing it.
     if (it == chunkedMessageCache_.end() || !it->second.validateChunkId(chunkId)) {
+        std::set<MessageId> chunksToRedeliver;
+        bool redeliver = true;
         if (it == chunkedMessageCache_.end()) {
             LOG_ERROR("Received an uncached chunk (uuid: " << uuid << " chunkId: " << chunkId
                                                            << ", messageId: " << messageId << ")");
+            auto abandonedIt = abandonedChunkedMessages_.find(uuid);
+            if (expireTimeOfIncompleteChunkedMessageMs_ > 0 && metadata.has_publish_time() &&
+                TimeUtils::currentTimeMillis() >
+                    static_cast<int64_t>(metadata.publish_time()) + expireTimeOfIncompleteChunkedMessageMs_) {
+                // The message is too old to be completed: acknowledge the chunk, as the Java client does.
+                // This also bounds the redelivery of the chunks whose first chunk never comes back.
+                redeliver = false;
+            } else if (abandonedIt != abandonedChunkedMessages_.end()) {
+                // The earlier chunks were either redelivered or acknowledged, do the same with this one.
+                redeliver = abandonedIt->second;
+            }
         } else {
+            // The context is dropped: request redelivery of its chunks along with this one, so that the
+            // message can be assembled again from the first chunk.
             LOG_ERROR("Received a chunk whose chunk id is invalid (uuid: "
                       << uuid << " chunkId: " << chunkId << ", messageId: " << messageId << ")");
+            for (const MessageId& msgId : it->second.getChunkedMessageIds()) {
+                chunksToRedeliver.insert(msgId);
+            }
             chunkedMessageCache_.remove(uuid);
+            rememberAbandonedChunkedMessage(uuid, true);
+        }
+        if (redeliver) {
+            chunksToRedeliver.insert(messageId);
+        } else {
+            discardChunkMessages(uuid, messageId, true);
         }
         lock.unlock();
         increaseAvailablePermits(cnx);
-        trackMessage(messageId);
+        if (!chunksToRedeliver.empty()) {
+            redeliverMessages(chunksToRedeliver);
+        }
         return boost::none;
     }
 

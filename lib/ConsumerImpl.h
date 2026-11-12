@@ -344,6 +344,15 @@ class ConsumerImpl : public ConsumerImplBase {
     MapCache<std::string, ChunkedMessageCtx> chunkedMessageCache_;
     mutable std::mutex chunkProcessMutex_;
 
+    // UUIDs of the chunked messages whose context was abandoned before the message was completed. The value
+    // tells what to do with a later chunk of the same message that arrives without a context: `true` to
+    // request its redelivery (the earlier chunks were redelivered too, so the message can be assembled
+    // again), `false` to acknowledge it (the earlier chunks were acknowledged). Bounded by
+    // `MaxAbandonedChunkedMessages`, the oldest entries are removed first. Protected by `chunkProcessMutex_`.
+    static constexpr size_t MaxAbandonedChunkedMessages = 10000;
+    MapCache<std::string, bool> abandonedChunkedMessages_;
+    void rememberAbandonedChunkedMessage(const std::string& uuid, bool redeliver);
+
     const long expireTimeOfIncompleteChunkedMessageMs_;
     DeadlineTimerPtr checkExpiredChunkedTimer_;
     std::atomic_bool expireChunkMessageTaskScheduled_{false};
