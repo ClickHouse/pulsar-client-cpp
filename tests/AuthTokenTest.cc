@@ -22,10 +22,13 @@
 #include <pulsar/Client.h>
 
 #include <boost/algorithm/string.hpp>
+#include <cctype>
 #include <fstream>
 #include <streambuf>
 #include <string>
+#include <variant>
 
+#include "VariantHelper.h"
 #include "lib/Future.h"
 #include "lib/LogUtils.h"
 #include "lib/Utils.h"
@@ -42,10 +45,22 @@ static const std::string serviceUrlHttp = "http://localhost:8080";
 
 static const std::string tokenPath = TOKEN_PATH;
 
-static std::string getToken() {
+std::string getToken() {
     std::ifstream file(tokenPath);
     std::string str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    while (!str.empty() && isspace(str.back())) {
+        str.pop_back();
+    }
     return str;
+}
+
+template <typename T>
+void assertV2Error(const std::variant<Error, T>& result, Result expectedResult,
+                   const std::string& expectedMessage) {
+    const auto* error = std::get_if<Error>(&result);
+    ASSERT_NE(nullptr, error);
+    EXPECT_EQ(expectedResult, error->result);
+    EXPECT_EQ(expectedMessage, error->message);
 }
 
 TEST(AuthPluginToken, testToken) {
@@ -175,10 +190,17 @@ TEST(AuthPluginToken, testNoAuth) {
 
     std::string topicName = "persistent://private/auth/test-token";
     std::string subName = "subscription-name";
+    const std::string expectedErrorMessage = "Client is not authorized to Get Partition Metadata";
 
     Producer producer;
     Result result = client.createProducer(topicName, producer);
     ASSERT_EQ(ResultAuthorizationError, result);
+
+    assertV2Error(client.createProducerV2(topicName, {}), ResultAuthorizationError, expectedErrorMessage);
+    assertV2Error(client.subscribeV2(topicName, subName, {}), ResultAuthorizationError, expectedErrorMessage);
+    assertV2Error(client.createReaderV2(topicName, MessageId::earliest(), {}), ResultAuthorizationError,
+                  expectedErrorMessage);
+    assertV2Error(client.createTableViewV2(topicName, {}), ResultAuthorizationError, expectedErrorMessage);
 
     Consumer consumer;
     result = client.subscribe(topicName, subName, consumer);
@@ -196,7 +218,36 @@ TEST(AuthPluginToken, testNoAuthWithHttp) {
     Result result = client.createProducer(topicName, producer);
     ASSERT_EQ(ResultConnectError, result);
 
+    std::visit(overloaded{[](Error&& error) {
+                              ASSERT_EQ(ResultConnectError, error.result);
+                              ASSERT_TRUE(error.message.find("The requested URL returned error: 401") !=
+                                          std::string::npos);
+                          },
+                          [](auto&&) { FAIL(); }},
+               client.createProducerV2(topicName, {}));
+
     Consumer consumer;
     result = client.subscribe(topicName, subName, consumer);
     ASSERT_EQ(ResultConnectError, result);
+}
+
+TEST(AuthPluginToken, testTokenSupplierException) {
+    ClientConfiguration config;
+    config.setAuth(
+        AuthToken::create([]() -> std::string { throw std::runtime_error("failed to generate token"); }));
+    Client client(serviceUrl, config);
+    Producer producer;
+    ASSERT_EQ(ResultAuthenticationError, client.createProducer("topic", producer));
+
+    std::visit(
+        overloaded{[](Error&& error) {
+                       ASSERT_EQ(ResultAuthenticationError, error.result);
+                       ASSERT_TRUE(error.message.find("failed to generate token") != std::string::npos);
+                   },
+                   [](auto&&) { FAIL(); }},
+        client.createProducerV2("topic", {}));
+
+    ASSERT_EQ(ResultOk, client.close());
+
+    client.close();
 }

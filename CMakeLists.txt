@@ -19,15 +19,19 @@
 
 cmake_minimum_required(VERSION 3.13)
 
-option(USE_ASIO "Use Asio instead of Boost.Asio" OFF)
-
 option(INTEGRATE_VCPKG "Integrate with Vcpkg" OFF)
 if (INTEGRATE_VCPKG)
-    set(USE_ASIO ON)
+    option(USE_ASIO "Use Asio instead of Boost.Asio" ON)
     if (NOT CMAKE_TOOLCHAIN_FILE)
         set(CMAKE_TOOLCHAIN_FILE "${CMAKE_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake")
     endif ()
+    if (NOT USE_ASIO)
+        list(APPEND VCPKG_MANIFEST_FEATURES "boost-asio")
+    endif ()
+else ()
+    option(USE_ASIO "Use Asio instead of Boost.Asio" OFF)
 endif ()
+message(STATUS "USE_ASIO: ${USE_ASIO}")
 
 option(BUILD_TESTS "Build tests" ON)
 message(STATUS "BUILD_TESTS:  " ${BUILD_TESTS})
@@ -62,6 +66,14 @@ if(CCACHE_PROGRAM)
 endif(CCACHE_PROGRAM)
 
 MESSAGE(STATUS "ARCHITECTURE: ${CMAKE_SYSTEM_PROCESSOR}")
+set(PULSAR_TARGET_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
+if (APPLE AND CMAKE_OSX_ARCHITECTURES)
+    list(LENGTH CMAKE_OSX_ARCHITECTURES PULSAR_OSX_ARCH_COUNT)
+    if (PULSAR_OSX_ARCH_COUNT EQUAL 1)
+        set(PULSAR_TARGET_PROCESSOR "${CMAKE_OSX_ARCHITECTURES}")
+    endif ()
+endif ()
+MESSAGE(STATUS "TARGET_ARCHITECTURE: ${PULSAR_TARGET_PROCESSOR}")
 
 option(BUILD_DYNAMIC_LIB "Build dynamic lib" ON)
 MESSAGE(STATUS "BUILD_DYNAMIC_LIB:  " ${BUILD_DYNAMIC_LIB})
@@ -79,6 +91,10 @@ set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 find_package(Threads REQUIRED)
 MESSAGE(STATUS "Threads library: " ${CMAKE_THREAD_LIBS_INIT})
 
+if (NOT CMAKE_CXX_STANDARD)
+    set(CMAKE_CXX_STANDARD 17)
+endif ()
+
 # Compiler specific configuration:
 # https://stackoverflow.com/questions/10046114/in-cmake-how-can-i-test-if-the-compiler-is-clang
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
@@ -91,14 +107,12 @@ else() # GCC or Clang are mostly compatible:
     add_compile_options(-Wall -Wformat-security -Wvla -Werror) 
     # Turn off certain warnings that are too much pain for too little gain:
     add_compile_options(-Wno-sign-compare -Wno-deprecated-declarations -Wno-error=cpp)
-    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" OR APPLE)
+    if (PULSAR_TARGET_PROCESSOR STREQUAL "x86_64")
         add_compile_options(-msse4.2 -mpclmul)
     endif()
     # Options unique to Clang or GCC:
     if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         add_compile_options(-Qunused-arguments) 
-    elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 8.1))
-        add_compile_options(-Wno-stringop-truncation)
     endif()
 endif()
 
@@ -110,9 +124,6 @@ set(AUTOGEN_DIR ${PROJECT_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${AUTOGEN_DIR})
 
 if (INTEGRATE_VCPKG)
-    if (NOT CMAKE_CXX_STANDARD)
-        set(CMAKE_CXX_STANDARD 11)
-    endif ()
     set(CMAKE_C_STANDARD 11)
     set(Boost_NO_BOOST_CMAKE ON)
     find_package(Boost REQUIRED)
@@ -124,6 +135,7 @@ if (INTEGRATE_VCPKG)
     find_package(ZLIB REQUIRED)
     find_package(OpenSSL REQUIRED)
     find_package(protobuf CONFIG REQUIRED)
+    find_package(absl CONFIG REQUIRED)
     find_package(zstd CONFIG REQUIRED)
     find_package(Snappy CONFIG REQUIRED)
     set(COMMON_LIBS CURL::libcurl
@@ -131,6 +143,17 @@ if (INTEGRATE_VCPKG)
         OpenSSL::SSL
         OpenSSL::Crypto
         protobuf::libprotobuf
+        absl::base
+        absl::log
+        absl::log_internal_message
+        absl::log_internal_check_op
+        absl::status
+        absl::statusor
+        absl::strings
+        absl::str_format
+        absl::time
+        absl::synchronization
+        absl::cord
         $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>
         Snappy::snappy
         )

@@ -20,9 +20,13 @@
 #include <pulsar/Client.h>
 
 #include <chrono>
+#include <future>
+#include <thread>
 
 #include "ThreadSafeMessages.h"
 #include "lib/LogUtils.h"
+#include "lib/MockServer.h"
+#include "tests/PulsarFriend.h"
 
 static const std::string lookupUrl = "pulsar://localhost:6650";
 
@@ -89,7 +93,7 @@ TEST(MultiTopicsConsumerTest, testSeekToNewerPosition) {
     consumer.close();
 
     // Test message listener
-    conf.setMessageListener([&messages](Consumer consumer, Message msg) { messages.add(msg); });
+    conf.setMessageListener([&messages](const Consumer& consumer, const Message& msg) { messages.add(msg); });
     messages.clear();
     messages.setMinNumMsgs(4);
     ASSERT_EQ(ResultOk, client.subscribe(topics, "sub-4", conf, consumer));
@@ -101,5 +105,71 @@ TEST(MultiTopicsConsumerTest, testSeekToNewerPosition) {
     ASSERT_TRUE(messages.wait(std::chrono::seconds(3)));
     ASSERT_EQ(messages.getSortedValues(), (std::vector<std::string>{"1-1", "2-1"}));
 
+    client.close();
+}
+
+TEST(MultiTopicsConsumerTest, testAcknowledgeInvalidMessageId) {
+    const std::string topicPrefix = "multi-topics-consumer-ack-invalid-msg-id";
+    Client client{lookupUrl};
+    std::vector<std::string> topics(2);
+    for (size_t i = 0; i < topics.size(); i++) {
+        Producer producer;
+        auto topic = topicPrefix + unique_str();
+        ASSERT_EQ(ResultOk, client.createProducer(topic, producer));
+        ASSERT_EQ(ResultOk, producer.send(MessageBuilder().setContent("msg-" + std::to_string(i)).build()));
+        topics[i] = std::move(topic);
+    }
+
+    Consumer consumer;
+    ConsumerConfiguration conf;
+    conf.setSubscriptionInitialPosition(InitialPositionEarliest);
+    ASSERT_EQ(ResultOk, client.subscribe(topics, "sub", conf, consumer));
+
+    std::vector<MessageId> msgIds(topics.size());
+    for (size_t i = 0; i < topics.size(); i++) {
+        Message msg;
+        ASSERT_EQ(ResultOk, consumer.receive(msg, 3000));
+        std::string serialized;
+        msg.getMessageId().serialize(serialized);
+        msgIds[i] = MessageId::deserialize(serialized);
+    }
+
+    ASSERT_EQ(ResultOperationNotSupported, consumer.acknowledge(msgIds[0]));
+    ASSERT_EQ(ResultOperationNotSupported, consumer.acknowledge(msgIds));
+    ASSERT_EQ(ResultOperationNotSupported, consumer.acknowledgeCumulative(msgIds[1]));
+
+    msgIds[0].setTopicName("invalid-topic");
+    msgIds[1].setTopicName("invalid-topic");
+    ASSERT_EQ(ResultOperationNotSupported, consumer.acknowledge(msgIds[0]));
+    ASSERT_EQ(ResultOperationNotSupported, consumer.acknowledge(msgIds));
+    ASSERT_EQ(ResultOperationNotSupported, consumer.acknowledgeCumulative(msgIds[1]));
+
+    client.close();
+}
+
+TEST(MultiTopicsConsumerTest, testGetConsumerStatsFail) {
+    Client client{lookupUrl};
+    std::vector<std::string> topics{"testGetConsumerStatsFail0", "testGetConsumerStatsFail1"};
+    Consumer consumer;
+    ASSERT_EQ(ResultOk, client.subscribe(topics, "sub", consumer));
+
+    auto connection = *PulsarFriend::getConnections(client).begin();
+    auto mockServer = std::make_shared<MockServer>(connection);
+    connection->attachMockServer(mockServer);
+
+    mockServer->setRequestDelay({{"CONSUMER_STATS", 3000}});
+    auto future = std::async(std::launch::async, [&consumer]() {
+        BrokerConsumerStats stats;
+        return consumer.getBrokerConsumerStats(stats);
+    });
+    const auto expectedRequests = topics.size();
+    ASSERT_TRUE(waitUntil(std::chrono::seconds(1), [connection, expectedRequests] {
+        return PulsarFriend::getPendingConsumerStatsRequests(*connection) == expectedRequests;
+    }));
+
+    connection->close(Error{ResultDisconnected, ""});
+    ASSERT_EQ(ResultDisconnected, future.get());
+
+    mockServer->close();
     client.close();
 }

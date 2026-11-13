@@ -20,15 +20,17 @@
 #define _PULSAR_HANDLER_BASE_HEADER_
 #include <pulsar/Result.h>
 
-#include <boost/optional.hpp>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include "AsioTimer.h"
 #include "Backoff.h"
 #include "Future.h"
 #include "TimeUtils.h"
+
+using std::optional;
 
 namespace pulsar {
 
@@ -49,6 +51,13 @@ class HandlerBase : public std::enable_shared_from_this<HandlerBase> {
 
     void start();
 
+    /*
+     * Start and, on the initial connect, go straight to @p assignedBrokerUrl instead of
+     * doing a topic lookup. Used by scalable-topics per-segment producers pinned to the
+     * DAG-provided owner broker. An empty optional behaves exactly like start().
+     */
+    void start(const optional<std::string>& assignedBrokerUrl);
+
     ClientConnectionWeakPtr getCnx() const;
     void setCnx(const ClientConnectionPtr& cnx);
     void resetCnx() { setCnx(nullptr); }
@@ -60,7 +69,7 @@ class HandlerBase : public std::enable_shared_from_this<HandlerBase> {
      * tries reconnection and sets connection_ to valid object
      * @param assignedBrokerUrl assigned broker url to directly connect to without lookup
      */
-    void grabCnx(const boost::optional<std::string>& assignedBrokerUrl);
+    void grabCnx(const optional<std::string>& assignedBrokerUrl);
 
     /*
      * tries reconnection and sets connection_ to valid object
@@ -71,7 +80,7 @@ class HandlerBase : public std::enable_shared_from_this<HandlerBase> {
      * Schedule reconnection after backoff time
      * @param assignedBrokerUrl assigned broker url to directly connect to without lookup
      */
-    void scheduleReconnection(const boost::optional<std::string>& assignedBrokerUrl);
+    void scheduleReconnection(const optional<std::string>& assignedBrokerUrl);
     /*
      * Schedule reconnection after backoff time
      */
@@ -91,7 +100,7 @@ class HandlerBase : public std::enable_shared_from_this<HandlerBase> {
      * @return ResultError if there was a failure. ResultRetryable if reconnection is needed.
      * @return Do not use bool, only Result.
      */
-    virtual Future<Result, bool> connectionOpened(const ClientConnectionPtr& connection) = 0;
+    virtual Future<Error, bool> connectionOpened(const ClientConnectionPtr& connection) = 0;
 
     virtual void connectionFailed(Result result) = 0;
 
@@ -108,11 +117,11 @@ class HandlerBase : public std::enable_shared_from_this<HandlerBase> {
     const std::shared_ptr<std::string> topic_;
 
     Future<Result, ClientConnectionPtr> getConnection(const ClientImplPtr& client,
-                                                      const boost::optional<std::string>& assignedBrokerUrl);
+                                                      const optional<std::string>& assignedBrokerUrl);
 
     void handleDisconnection(Result result, const ClientConnectionPtr& cnx);
 
-    void handleTimeout(const ASIO_ERROR& ec, const boost::optional<std::string>& assignedBrokerUrl);
+    void handleTimeout(const ASIO_ERROR& ec, const optional<std::string>& assignedBrokerUrl);
 
    protected:
     ClientImplWeakPtr client_;
@@ -136,11 +145,14 @@ class HandlerBase : public std::enable_shared_from_this<HandlerBase> {
         Failed,           // Handler is failed, in Java client: HandlerState.State.Failed
         Producer_Fenced,  // The producer has been fenced by the broker
                           // in Java client: HandlerState.State.ProducerFenced
+        Terminated,       // The topic has been terminatedproducer has been fenced by the broker
+                          // in Java client: HandlerState.State.Terminated
     };
 
     std::atomic<State> state_;
     Backoff backoff_;
     uint64_t epoch_;
+    std::atomic<bool> reconnectionPending_;
 
     Result convertToTimeoutIfNecessary(Result result, ptime startTimestamp) const;
 
@@ -148,18 +160,24 @@ class HandlerBase : public std::enable_shared_from_this<HandlerBase> {
         firstRequestIdAfterConnect_.store(requestId, std::memory_order_release);
     }
 
+    bool changeToReadyState() noexcept {
+        State expected = Pending;
+        return state_ == Ready || state_.compare_exchange_strong(expected, Ready);
+    }
+
    private:
     DeadlineTimerPtr timer_;
     DeadlineTimerPtr creationTimer_;
 
     mutable std::mutex connectionMutex_;
-    std::atomic<bool> reconnectionPending_;
     ClientConnectionWeakPtr connection_;
     std::string redirectedClusterURI_;
     std::atomic<long> firstRequestIdAfterConnect_{-1L};
+    std::atomic<long> connectionTimeMs_{0};  // only for tests
 
     friend class ClientConnection;
     friend class PulsarFriend;
+    friend class ConsumerTest;
 };
 }  // namespace pulsar
 #endif  //_PULSAR_HANDLER_BASE_HEADER_

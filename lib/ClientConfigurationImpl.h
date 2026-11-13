@@ -20,8 +20,10 @@
 #define LIB_CLIENTCONFIGURATIONIMPL_H_
 
 #include <pulsar/ClientConfiguration.h>
+#include <pulsar/ServiceInfo.h>
 
 #include <chrono>
+#include <optional>
 
 namespace pulsar {
 
@@ -30,7 +32,7 @@ struct ClientConfigurationImpl {
     uint64_t memoryLimit{0ull};
     int ioThreads{1};
     int connectionsPerBroker{1};
-    std::chrono::nanoseconds operationTimeout{30L * 1000 * 1000 * 1000};
+    std::chrono::nanoseconds operationTimeout{30LL * 1000 * 1000 * 1000};
     int messageListenerThreads{1};
     int concurrentLookupRequest{50000};
     int maxLookupRedirects{20};
@@ -47,12 +49,19 @@ struct ClientConfigurationImpl {
     unsigned int partitionsUpdateInterval{60};  // 1 minute
     std::string listenerName;
     int connectionTimeoutMs{10000};  // 10 seconds
+    unsigned int keepAliveIntervalInSeconds{30};
     std::string description;
     std::string proxyServiceUrl;
     ClientConfiguration::ProxyProtocol proxyProtocol;
+    bool httpLookupAuthAllowRedirect{false};
     ClientConfiguration::ConnectionValidator connectionValidator;
 
     std::unique_ptr<LoggerFactory> takeLogger() { return std::move(loggerFactory); }
+
+    ServiceInfo toServiceInfo(const std::string& serviceUrl) const {
+        return {serviceUrl, authenticationPtr,
+                tlsTrustCertsFilePath.empty() ? std::nullopt : std::make_optional(tlsTrustCertsFilePath)};
+    }
 };
 }  // namespace pulsar
 

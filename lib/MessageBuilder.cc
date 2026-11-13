@@ -60,29 +60,35 @@ void MessageBuilder::checkMetadata() {
 MessageBuilder& MessageBuilder::setContent(const void* data, size_t size) {
     checkMetadata();
     impl_->payload = SharedBuffer::copy((char*)data, size);
+    impl_->metadata.clear_null_value();
     return *this;
 }
 
 MessageBuilder& MessageBuilder::setAllocatedContent(void* data, size_t size) {
     checkMetadata();
     impl_->payload = SharedBuffer::wrap((char*)data, size);
+    impl_->metadata.clear_null_value();
     return *this;
 }
 
 MessageBuilder& MessageBuilder::setContent(const std::string& data) {
     checkMetadata();
     impl_->payload = SharedBuffer::copy((char*)data.c_str(), data.length());
+    impl_->metadata.clear_null_value();
     return *this;
 }
 
 MessageBuilder& MessageBuilder::setContent(std::string&& data) {
     checkMetadata();
     impl_->payload = SharedBuffer::take(std::move(data));
+    impl_->metadata.clear_null_value();
     return *this;
 }
 
 MessageBuilder& MessageBuilder::setContent(const KeyValue& data) {
+    checkMetadata();
     impl_->keyValuePtr = data.impl_;
+    impl_->metadata.clear_null_value();
     return *this;
 }
 
@@ -149,11 +155,18 @@ MessageBuilder& MessageBuilder::setReplicationClusters(const std::vector<std::st
 
 MessageBuilder& MessageBuilder::disableReplication(bool flag) {
     checkMetadata();
-    google::protobuf::RepeatedPtrField<std::string> r;
+    google::protobuf::RepeatedPtrField<std::string>* replicateTo = impl_->metadata.mutable_replicate_to();
+    replicateTo->Clear();
     if (flag) {
-        r.AddAllocated(new std::string("__local__"));
+        replicateTo->Add("__local__");
     }
-    r.Swap(impl_->metadata.mutable_replicate_to());
+    return *this;
+}
+
+MessageBuilder& MessageBuilder::setNullValue() {
+    checkMetadata();
+    impl_->metadata.set_null_value(true);
+    impl_->payload = SharedBuffer();
     return *this;
 }
 

@@ -23,13 +23,19 @@
 
 #include <atomic>
 #ifdef USE_ASIO
-#include <asio/io_service.hpp>
+#include <asio/dispatch.hpp>
+#include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
+#include <asio/post.hpp>
 #include <asio/ssl.hpp>
+#include <asio/steady_timer.hpp>
 #else
-#include <boost/asio/io_service.hpp>
+#include <boost/asio/dispatch.hpp>
+#include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/asio/steady_timer.hpp>
 #endif
 #include <chrono>
 #include <condition_variable>
@@ -37,6 +43,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 #include "AsioTimer.h"
 
@@ -46,7 +53,7 @@ typedef std::shared_ptr<ASIO::ssl::stream<ASIO::ip::tcp::socket &> > TlsSocketPt
 typedef std::shared_ptr<ASIO::ip::tcp::resolver> TcpResolverPtr;
 class PULSAR_PUBLIC ExecutorService : public std::enable_shared_from_this<ExecutorService> {
    public:
-    using IOService = ASIO::io_service;
+    using IOService = ASIO::io_context;
     using SharedPtr = std::shared_ptr<ExecutorService>;
 
     static SharedPtr create();
@@ -62,19 +69,38 @@ class PULSAR_PUBLIC ExecutorService : public std::enable_shared_from_this<Execut
     TcpResolverPtr createTcpResolver();
     // throws std::runtime_error if failed
     DeadlineTimerPtr createDeadlineTimer();
-    void postWork(std::function<void(void)> task);
+
+    template <typename Duration>
+    ASIO::steady_timer createTimer(const Duration &duration) {
+        auto timer = ASIO::steady_timer(io_context_);
+        timer.expires_after(duration);
+        return timer;
+    }
+
+    // Execute the task in the event loop thread asynchronously, i.e. the task will be put in the event loop
+    // queue and executed later.
+    template <typename T>
+    void postWork(T &&task) {
+        ASIO::post(io_context_, std::forward<T>(task));
+    }
+
+    // Different from `postWork`, if it's already in the event loop, execute the task immediately
+    template <typename T>
+    void dispatch(T &&task) {
+        ASIO::dispatch(io_context_, std::forward<T>(task));
+    }
 
     // See TimeoutProcessor for the semantics of the parameter.
     void close(long timeoutMs = 3000);
 
-    IOService &getIOService() { return io_service_; }
+    IOService &getIOService() { return io_context_; }
     bool isClosed() const noexcept { return closed_; }
 
    private:
     /*
-     * io_service is our interface to os, io object schedule async ops on this object
+     * io_context is our interface to os, io object schedule async ops on this object
      */
-    IOService io_service_;
+    IOService io_context_;
 
     std::atomic_bool closed_{false};
     std::mutex mutex_;

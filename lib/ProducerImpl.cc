@@ -48,9 +48,10 @@ DECLARE_LOG_OBJECT()
 
 using std::chrono::milliseconds;
 
-ProducerImpl::ProducerImpl(ClientImplPtr client, const TopicName& topicName,
+ProducerImpl::ProducerImpl(const ClientImplPtr& client, const TopicName& topicName,
                            const ProducerConfiguration& conf, const ProducerInterceptorsPtr& interceptors,
-                           int32_t partition, bool retryOnCreationError)
+                           int32_t partition, bool retryOnCreationError,
+                           const optional<std::string>& assignedBrokerUrl)
     : HandlerBase(client, (partition < 0) ? topicName.toString() : topicName.getTopicPartitionName(partition),
                   Backoff(milliseconds(client->getClientConfig().getInitialBackoffIntervalMs()),
                           milliseconds(client->getClientConfig().getMaxBackoffIntervalMs()),
@@ -58,6 +59,7 @@ ProducerImpl::ProducerImpl(ClientImplPtr client, const TopicName& topicName,
       conf_(conf),
       semaphore_(),
       partition_(partition),
+      assignedBrokerUrl_(assignedBrokerUrl),
       producerName_(conf_.getProducerName()),
       userProvidedProducerName_(false),
       producerStr_("[" + topic() + ", " + producerName_ + "] "),
@@ -114,11 +116,12 @@ ProducerImpl::ProducerImpl(ClientImplPtr client, const TopicName& topicName,
 }
 
 ProducerImpl::~ProducerImpl() {
-    LOG_DEBUG(getName() << "~ProducerImpl");
-    shutdown();
-    printStats();
-    if (state_ == Ready || state_ == Pending) {
-        LOG_WARN(getName() << "Destroyed producer which was not properly closed");
+    auto client = client_.lock();
+    internalShutdown();
+    if (client) {
+        if (state_ == Ready || state_ == Pending) {
+            LOG_WARN(producerStr_ << "Destroyed producer which was not properly closed");
+        }
     }
 }
 
@@ -134,13 +137,12 @@ void ProducerImpl::beforeConnectionChange(ClientConnection& connection) {
     connection.removeProducer(producerId_);
 }
 
-Future<Result, bool> ProducerImpl::connectionOpened(const ClientConnectionPtr& cnx) {
-    // Do not use bool, only Result.
-    Promise<Result, bool> promise;
+Future<Error, bool> ProducerImpl::connectionOpened(const ClientConnectionPtr& cnx) {
+    Promise<Error, bool> promise;
 
     if (state_ == Closed) {
         LOG_DEBUG(getName() << "connectionOpened : Producer is already closed");
-        promise.setFailed(ResultAlreadyClosed);
+        promise.setFailed(Error{ResultAlreadyClosed, ""});
         return promise.getFuture();
     }
 
@@ -161,13 +163,13 @@ Future<Result, bool> ProducerImpl::connectionOpened(const ClientConnectionPtr& c
     // Keep a reference to ensure object is kept alive.
     auto self = shared_from_this();
     setFirstRequestIdAfterConnect(requestId);
-    cnx->sendRequestWithId(cmd, requestId)
-        .addListener([this, self, cnx, promise](Result result, const ResponseData& responseData) {
-            Result handleResult = handleCreateProducer(cnx, result, responseData);
-            if (handleResult == ResultOk) {
+    cnx->sendRequestWithId(cmd, requestId, "PRODUCER")
+        .addListener([this, self, cnx, promise](const Error& error, const ResponseData& responseData) {
+            auto handledError = handleCreateProducer(cnx, error, responseData);
+            if (handledError.result == ResultOk) {
                 promise.setSuccess();
             } else {
-                promise.setFailed(handleResult);
+                promise.setFailed(handledError);
             }
         });
 
@@ -182,22 +184,23 @@ void ProducerImpl::connectionFailed(Result result) {
         // if producers are lazy, then they should always try to restart
         // so don't change the state and allow reconnections
         return;
-    } else if (!isResultRetryable(result) && producerCreatedPromise_.setFailed(result)) {
+    } else if (!isResultRetryable(result) && producerCreatedPromise_.setFailed(Error{result, ""})) {
         state_ = Failed;
     }
 }
 
-Result ProducerImpl::handleCreateProducer(const ClientConnectionPtr& cnx, Result result,
-                                          const ResponseData& responseData) {
+Error ProducerImpl::handleCreateProducer(const ClientConnectionPtr& cnx, const Error& error,
+                                         const ResponseData& responseData) {
     Result handleResult = ResultOk;
 
     Lock lock(mutex_);
 
-    LOG_DEBUG(getName() << "ProducerImpl::handleCreateProducer res: " << strResult(result));
+    LOG_DEBUG(getName() << "ProducerImpl::handleCreateProducer res: " << error);
 
     // make sure we're still in the Pending/Ready state, closeAsync could have been invoked
     // while waiting for this response if using lazy producers
     const auto state = state_.load();
+    const auto result = error.result;
     if (state != Ready && state != Pending) {
         LOG_DEBUG("Producer created response received but producer already closed");
         failPendingMessages(ResultAlreadyClosed, false);
@@ -205,14 +208,15 @@ Result ProducerImpl::handleCreateProducer(const ClientConnectionPtr& cnx, Result
             auto client = client_.lock();
             if (client) {
                 int requestId = client->newRequestId();
-                cnx->sendRequestWithId(Commands::newCloseProducer(producerId_, requestId), requestId);
+                cnx->sendRequestWithId(Commands::newCloseProducer(producerId_, requestId), requestId,
+                                       "CLOSE_PRODUCER");
             }
         }
         if (!producerCreatedPromise_.isComplete()) {
             lock.unlock();
-            producerCreatedPromise_.setFailed(ResultAlreadyClosed);
+            producerCreatedPromise_.setFailed(Error{ResultAlreadyClosed, ""});
         }
-        return ResultAlreadyClosed;
+        return Error{ResultAlreadyClosed, ""};
     }
 
     if (result == ResultOk) {
@@ -267,19 +271,20 @@ Result ProducerImpl::handleCreateProducer(const ClientConnectionPtr& cnx, Result
             auto client = client_.lock();
             if (client) {
                 int requestId = client->newRequestId();
-                cnx->sendRequestWithId(Commands::newCloseProducer(producerId_, requestId), requestId);
+                cnx->sendRequestWithId(Commands::newCloseProducer(producerId_, requestId), requestId,
+                                       "CLOSE_PRODUCER");
             }
         }
 
-        if (result == ResultProducerFenced) {
-            state_ = Producer_Fenced;
+        if (result == ResultProducerFenced || result == ResultTopicTerminated) {
+            state_ = result == ResultProducerFenced ? Producer_Fenced : Terminated;
             failPendingMessages(result, false);
             auto client = client_.lock();
             if (client) {
                 client->cleanupProducer(this);
             }
             lock.unlock();
-            producerCreatedPromise_.setFailed(result);
+            producerCreatedPromise_.setFailed(error);
             handleResult = result;
         } else if (producerCreatedPromise_.isComplete() || retryOnCreationError_) {
             if (result == ResultProducerBlockedQuotaExceededException) {
@@ -290,24 +295,25 @@ Result ProducerImpl::handleCreateProducer(const ClientConnectionPtr& cnx, Result
             }
 
             // Producer had already been initially created, we need to retry connecting in any case
-            LOG_WARN(getName() << "Failed to reconnect producer: " << strResult(result));
+            LOG_WARN(getName() << "Failed to reconnect producer: " << error);
             handleResult = ResultRetryable;
         } else {
             // Producer was not yet created, retry to connect to broker if it's possible
             handleResult = convertToTimeoutIfNecessary(result, creationTimestamp_);
+            Error convertedError{handleResult, error.message};
             if (isResultRetryable(handleResult)) {
-                LOG_WARN(getName() << "Temporary error in creating producer: " << strResult(handleResult));
+                LOG_WARN(getName() << "Temporary error in creating producer: " << convertedError);
             } else {
-                LOG_ERROR(getName() << "Failed to create producer: " << strResult(handleResult));
+                LOG_ERROR(getName() << "Failed to create producer: " << error);
                 failPendingMessages(handleResult, false);
                 state_ = Failed;
                 lock.unlock();
-                producerCreatedPromise_.setFailed(handleResult);
+                producerCreatedPromise_.setFailed(convertedError);
             }
         }
     }
 
-    return handleResult;
+    return handleResult == error.result ? error : Error{handleResult, error.message};
 }
 
 auto ProducerImpl::getPendingCallbacksWhenFailed() -> decltype(pendingMessagesQueue_) {
@@ -353,7 +359,7 @@ void ProducerImpl::failPendingMessages(Result result, bool withLock) {
     }
 }
 
-void ProducerImpl::resendMessages(ClientConnectionPtr cnx) {
+void ProducerImpl::resendMessages(const ClientConnectionPtr& cnx) {
     if (pendingMessagesQueue_.empty()) {
         return;
     }
@@ -447,6 +453,9 @@ bool ProducerImpl::isValidProducerState(const SendCallback& callback) const {
             return false;
         case HandlerBase::Producer_Fenced:
             callback(ResultProducerFenced, {});
+            return false;
+        case HandlerBase::Terminated:
+            callback(ResultTopicTerminated, {});
             return false;
         case HandlerBase::NotStarted:
         case HandlerBase::Failed:
@@ -571,7 +580,7 @@ void ProducerImpl::sendAsyncWithStatsUpdate(const Message& msg, SendCallback&& c
         bool isFirstMessage = batchMessageContainer_->isFirstMessageToAdd(msg);
         bool isFull = batchMessageContainer_->add(msg, callback);
         if (isFirstMessage) {
-            batchTimer_->expires_from_now(milliseconds(conf_.getBatchingMaxPublishDelayMs()));
+            batchTimer_->expires_after(milliseconds(conf_.getBatchingMaxPublishDelayMs()));
             auto weakSelf = weak_from_this();
             batchTimer_->async_wait([this, weakSelf](const ASIO_ERROR& ec) {
                 auto self = weakSelf.lock();
@@ -700,7 +709,7 @@ void ProducerImpl::releaseSemaphoreForSendOp(const OpSendMsg& op) {
 PendingFailures ProducerImpl::batchMessageAndSend(const FlushCallback& flushCallback) {
     PendingFailures failures;
     LOG_DEBUG("batchMessageAndSend " << *batchMessageContainer_);
-    batchTimer_->cancel();
+    cancelTimer(*batchTimer_);
     if (batchMessageContainer_->isEmpty()) {
         return failures;
     }
@@ -819,11 +828,11 @@ void ProducerImpl::closeAsync(CloseCallback originalCallback) {
 
     int requestId = client->newRequestId();
     auto self = shared_from_this();
-    cnx->sendRequestWithId(Commands::newCloseProducer(producerId_, requestId), requestId)
-        .addListener([self, callback](Result result, const ResponseData&) { callback(result); });
+    cnx->sendRequestWithId(Commands::newCloseProducer(producerId_, requestId), requestId, "CLOSE_PRODUCER")
+        .addListener([self, callback](const Error& error, const ResponseData&) { callback(error.result); });
 }
 
-Future<Result, ProducerImplBaseWeakPtr> ProducerImpl::getProducerCreatedFuture() {
+Future<Error, ProducerImplBaseWeakPtr> ProducerImpl::getProducerCreatedFuture() {
     return producerCreatedPromise_.getFuture();
 }
 
@@ -867,6 +876,18 @@ void ProducerImpl::handleSendTimeout(const ASIO_ERROR& err) {
     }
 
     lock.unlock();
+    if (pendingMessages.empty()) {
+        return;
+    }
+    auto cnx = getCnx().lock();
+    if (cnx) {
+        LOG_WARN(getName() << "Send timeout due to queueing delay, connection: " << cnx->cnxString()
+                           << ", pending messages: " << pendingMessages.size()
+                           << ", queue size: " << pendingMessagesQueue_.size());
+    } else {
+        LOG_WARN(getName() << "Send timeout due to queueing delay, no connection, pending messages: "
+                           << pendingMessages.size() << ", queue size: " << pendingMessagesQueue_.size());
+    }
     for (const auto& op : pendingMessages) {
         op->complete(ResultTimeout, {});
     }
@@ -880,7 +901,7 @@ bool ProducerImpl::removeCorruptMessage(uint64_t sequenceId) {
         return true;
     }
 
-    std::unique_ptr<OpSendMsg> op{std::move(pendingMessagesQueue_.front().release())};
+    std::unique_ptr<OpSendMsg> op{pendingMessagesQueue_.front().release()};
     uint64_t expectedSequenceId = op->sendArgs->sequenceId;
     if (sequenceId > expectedSequenceId) {
         LOG_WARN(getName() << "Got ack failure for msg " << sequenceId                //
@@ -923,19 +944,24 @@ bool ProducerImpl::ackReceived(uint64_t sequenceId, MessageId& rawMessageId) {
         return false;
     }
 
-    uint64_t expectedSequenceId = op.sendArgs->sequenceId;
-    if (sequenceId > expectedSequenceId) {
-        LOG_WARN(getName() << "Got ack for msg " << sequenceId                        //
-                           << " expecting: " << expectedSequenceId << " queue size="  //
-                           << pendingMessagesQueue_.size() << " producer: " << producerId_);
+    const uint64_t expectedFirstSequenceId = op.sendArgs->sequenceId;
+    const uint64_t expectedLastSequenceId = expectedFirstSequenceId + op.messagesCount - 1;
+    // Broker may ack with either the first or the last sequence id of the batch.
+    if (sequenceId > expectedLastSequenceId) {
+        LOG_WARN(getName() << "Got ack for msg " << sequenceId
+                           << " expecting last: " << expectedLastSequenceId
+                           << " queue size=" << pendingMessagesQueue_.size() << " producer: " << producerId_);
         return false;
-    } else if (sequenceId < expectedSequenceId) {
+    }
+    if (sequenceId < expectedFirstSequenceId) {
         // Ignoring the ack since it's referring to a message that has already timed out.
-        LOG_DEBUG(getName() << "Got ack for timed out msg " << sequenceId  //
-                            << " -- MessageId - " << messageId << " last-seq: " << expectedSequenceId
-                            << " producer: " << producerId_);
+        LOG_DEBUG(getName() << "Got ack for timed out msg " << sequenceId << " -- MessageId - " << messageId
+                            << " first-seq: " << expectedFirstSequenceId << " producer: " << producerId_);
         return true;
     }
+    // sequenceId is in [expectedFirstSequenceId, expectedLastSequenceId]; accept as matching this op.
+    const bool brokerSentFirst = (sequenceId == expectedFirstSequenceId);
+    lastSequenceIdPublished_ = brokerSentFirst ? expectedLastSequenceId : sequenceId;
 
     // Message was persisted correctly
     LOG_DEBUG(getName() << "Received ack for msg " << sequenceId);
@@ -950,7 +976,6 @@ bool ProducerImpl::ackReceived(uint64_t sequenceId, MessageId& rawMessageId) {
     }
 
     releaseSemaphoreForSendOp(op);
-    lastSequenceIdPublished_ = sequenceId + op.messagesCount - 1;
 
     std::unique_ptr<OpSendMsg> opSendMsg{pendingMessagesQueue_.front().release()};
     pendingMessagesQueue_.pop_front();
@@ -975,17 +1000,17 @@ bool ProducerImpl::encryptMessage(proto::MessageMetadata& metadata, SharedBuffer
                                encryptedPayload);
 }
 
-void ProducerImpl::disconnectProducer(const boost::optional<std::string>& assignedBrokerUrl) {
+void ProducerImpl::disconnectProducer(const optional<std::string>& assignedBrokerUrl) {
     LOG_INFO("Broker notification of Closed producer: "
-             << producerId_ << (assignedBrokerUrl ? (" assignedBrokerUrl: " + assignedBrokerUrl.get()) : ""));
+             << producerId_ << (assignedBrokerUrl ? (" assignedBrokerUrl: " + *assignedBrokerUrl) : ""));
     resetCnx();
     scheduleReconnection(assignedBrokerUrl);
 }
 
-void ProducerImpl::disconnectProducer() { disconnectProducer(boost::none); }
+void ProducerImpl::disconnectProducer() { disconnectProducer(std::nullopt); }
 
 void ProducerImpl::start() {
-    HandlerBase::start();
+    HandlerBase::start(assignedBrokerUrl_);
 
     if (conf_.getLazyStartPartitionedProducers() && conf_.getAccessMode() == ProducerConfiguration::Shared) {
         // we need to kick it off now as it is possible that the connection may take
@@ -994,7 +1019,9 @@ void ProducerImpl::start() {
     }
 }
 
-void ProducerImpl::shutdown() {
+void ProducerImpl::shutdown() { internalShutdown(); }
+
+void ProducerImpl::internalShutdown() {
     resetCnx();
     interceptors_->close();
     auto client = client_.lock();
@@ -1002,15 +1029,14 @@ void ProducerImpl::shutdown() {
         client->cleanupProducer(this);
     }
     cancelTimers();
-    producerCreatedPromise_.setFailed(ResultAlreadyClosed);
+    producerCreatedPromise_.setFailed(Error{ResultAlreadyClosed, ""});
     state_ = Closed;
 }
 
 void ProducerImpl::cancelTimers() noexcept {
     dataKeyRefreshTask_.stop();
-    ASIO_ERROR ec;
-    batchTimer_->cancel(ec);
-    sendTimer_->cancel(ec);
+    cancelTimer(*batchTimer_);
+    cancelTimer(*sendTimer_);
 }
 
 bool ProducerImplCmp::operator()(const ProducerImplPtr& a, const ProducerImplPtr& b) const {
@@ -1031,7 +1057,7 @@ void ProducerImpl::startSendTimeoutTimer() {
 }
 
 void ProducerImpl::asyncWaitSendTimeout(DurationType expiryTime) {
-    sendTimer_->expires_from_now(expiryTime);
+    sendTimer_->expires_after(expiryTime);
 
     auto weakSelf = weak_from_this();
     sendTimer_->async_wait([weakSelf](const ASIO_ERROR& err) {

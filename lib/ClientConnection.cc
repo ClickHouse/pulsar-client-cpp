@@ -18,9 +18,12 @@
  */
 #include "ClientConnection.h"
 
+#include <openssl/x509.h>
+#include <pulsar/Authentication.h>
 #include <pulsar/MessageIdBuilder.h>
+#include <pulsar/ServiceInfo.h>
 
-#include <boost/optional.hpp>
+#include <chrono>
 #include <fstream>
 
 #include "AsioDefines.h"
@@ -30,15 +33,27 @@
 #include "ConnectionPool.h"
 #include "ConsumerImpl.h"
 #include "ExecutorService.h"
+#include "Future.h"
 #include "LogUtils.h"
+#include "MockServer.h"
 #include "OpSendMsg.h"
 #include "ProducerImpl.h"
 #include "PulsarApi.pb.h"
 #include "ResultUtils.h"
+#include "ServiceNameResolver.h"
+#include "ServiceURI.h"
 #include "Url.h"
 #include "auth/AuthOauth2.h"
 #include "auth/InitialAuthData.h"
 #include "checksum/ChecksumProvider.h"
+
+#ifdef USE_ASIO
+#include <asio/connect.hpp>
+#include <asio/ssl/host_name_verification.hpp>
+#else
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ssl/host_name_verification.hpp>
+#endif
 
 DECLARE_LOG_OBJECT()
 
@@ -46,11 +61,19 @@ using namespace ASIO::ip;
 
 namespace pulsar {
 
+namespace {
+static std::ostream& operator<<(std::ostream& os, const tcp::resolver::results_type& results) {
+    for (const auto& entry : results) {
+        const auto& ep = entry.endpoint();
+        os << ep.address().to_string() << ":" << ep.port() << " ";
+    }
+    return os;
+}
+}  // anonymous namespace
+
 using proto::BaseCommand;
 
 static const uint32_t DefaultBufferSize = 64 * 1024;
-
-static const int KeepAliveIntervalInSeconds = 30;
 
 static MessageId toMessageId(const proto::MessageIdData& messageIdData) {
     return MessageIdBuilder::from(messageIdData).build();
@@ -159,46 +182,47 @@ static bool file_exists(const std::string& path) {
 }
 
 ClientConnection::ClientConnection(const std::string& logicalAddress, const std::string& physicalAddress,
-                                   ExecutorServicePtr executor,
+                                   const ServiceInfo& serviceInfo, const ExecutorServicePtr& executor,
                                    const ClientConfiguration& clientConfiguration,
-                                   const AuthenticationPtr& authentication, const std::string& clientVersion,
-                                   ConnectionPool& pool, size_t poolIndex)
+                                   const std::string& clientVersion, ConnectionPool& pool, size_t poolIndex)
     : operationsTimeout_(ClientImpl::getOperationTimeout(clientConfiguration)),
-      authentication_(authentication),
+      authentication_(serviceInfo.authentication()),
       serverProtocolVersion_(proto::ProtocolVersion_MIN),
       executor_(executor),
       resolver_(executor_->createTcpResolver()),
       socket_(executor_->createSocket()),
-      strand_(ASIO::make_strand(executor_->getIOService().get_executor())),
       logicalAddress_(logicalAddress),
       physicalAddress_(physicalAddress),
-      cnxString_("[<none> -> " + physicalAddress + "] "),
+      cnxStringPtr_(std::make_shared<std::string>("[<none> -> " + physicalAddress + "] ")),
       incomingBuffer_(SharedBuffer::allocate(DefaultBufferSize)),
-      connectTimeoutTask_(
-          std::make_shared<PeriodicTask>(*executor_, clientConfiguration.getConnectionTimeout())),
+      connectTimeout_(std::chrono::milliseconds(clientConfiguration.getConnectionTimeout())),
+      connectTimer_(executor_->createDeadlineTimer()),
       outgoingBuffer_(SharedBuffer::allocate(DefaultBufferSize)),
+      keepAliveIntervalInSeconds_(clientConfiguration.getKeepAliveIntervalInSeconds()),
       consumerStatsRequestTimer_(executor_->createDeadlineTimer()),
       maxPendingLookupRequest_(clientConfiguration.getConcurrentLookupRequest()),
       clientVersion_(clientVersion),
       pool_(pool),
       poolIndex_(poolIndex) {
-    LOG_INFO(cnxString_ << "Create ClientConnection, timeout=" << clientConfiguration.getConnectionTimeout());
+    LOG_INFO(cnxString() << "Create ClientConnection, timeout="
+                         << clientConfiguration.getConnectionTimeout());
     if (!authentication_) {
-        LOG_ERROR("Invalid authentication plugin");
-        throw ResultAuthenticationError;
+        throw Error{ResultAuthenticationError, "Invalid authentication plugin"};
         return;
     }
 
-    auto oauth2Auth = std::dynamic_pointer_cast<AuthOauth2>(authentication_);
-    if (oauth2Auth) {
+    if (auto oauth2Auth = std::dynamic_pointer_cast<AuthOauth2>(authentication_)) {
         // Configure the TLS trust certs file for Oauth2
         auto authData = std::dynamic_pointer_cast<AuthenticationDataProvider>(
-            std::make_shared<InitialAuthData>(clientConfiguration.getTlsTrustCertsFilePath()));
+            std::make_shared<InitialAuthData>(serviceInfo.tlsTrustCertsFilePath().value_or("")));
         oauth2Auth->getAuthData(authData);
     }
 
-    if (clientConfiguration.isUseTls()) {
-        ASIO::ssl::context ctx(ASIO::ssl::context::tlsv12_client);
+    if (serviceInfo.useTls()) {
+        ASIO::ssl::context ctx(ASIO::ssl::context::sslv23_client);
+        ctx.set_options(ASIO::ssl::context::default_workarounds | ASIO::ssl::context::no_sslv2 |
+                        ASIO::ssl::context::no_sslv3 | ASIO::ssl::context::no_tlsv1 |
+                        ASIO::ssl::context::no_tlsv1_1);
         Url serviceUrl;
         Url proxyUrl;
         Url::parse(physicalAddress, serviceUrl);
@@ -215,16 +239,17 @@ ClientConnection::ClientConnection(const std::string& logicalAddress, const std:
         } else {
             ctx.set_verify_mode(ASIO::ssl::context::verify_peer);
 
-            std::string trustCertFilePath = clientConfiguration.getTlsTrustCertsFilePath();
-            if (!trustCertFilePath.empty()) {
+            if (serviceInfo.tlsTrustCertsFilePath()) {
+                const auto& trustCertFilePath = *serviceInfo.tlsTrustCertsFilePath();
                 if (file_exists(trustCertFilePath)) {
                     ctx.load_verify_file(trustCertFilePath);
                 } else {
                     LOG_ERROR(trustCertFilePath << ": No such trustCertFile");
-                    throw ResultAuthenticationError;
+                    throw Error{ResultAuthenticationError, trustCertFilePath + ": No such trustCertFile"};
                 }
             } else {
                 ctx.set_default_verify_paths();
+                LOG_INFO("Use " << X509_get_default_cert_file() << " as default CA path");
             }
         }
 
@@ -237,18 +262,18 @@ ClientConnection::ClientConnection(const std::string& logicalAddress, const std:
             tlsPrivateKey = authData->getTlsPrivateKey();
             if (!file_exists(tlsCertificates)) {
                 LOG_ERROR(tlsCertificates << ": No such tlsCertificates");
-                throw ResultAuthenticationError;
+                throw Error{ResultAuthenticationError, tlsCertificates + ": No such tlsCertificates"};
             }
             if (!file_exists(tlsCertificates)) {
                 LOG_ERROR(tlsCertificates << ": No such tlsCertificates");
-                throw ResultAuthenticationError;
+                throw Error{ResultAuthenticationError, tlsCertificates + ": No such tlsCertificates"};
             }
             ctx.use_private_key_file(tlsPrivateKey, ASIO::ssl::context::pem);
-            ctx.use_certificate_file(tlsCertificates, ASIO::ssl::context::pem);
+            ctx.use_certificate_chain_file(tlsCertificates);
         } else {
             if (file_exists(tlsPrivateKey) && file_exists(tlsCertificates)) {
                 ctx.use_private_key_file(tlsPrivateKey, ASIO::ssl::context::pem);
-                ctx.use_certificate_file(tlsCertificates, ASIO::ssl::context::pem);
+                ctx.use_certificate_chain_file(tlsCertificates);
             }
         }
 
@@ -257,7 +282,7 @@ ClientConnection::ClientConnection(const std::string& logicalAddress, const std:
         if (!clientConfiguration.isTlsAllowInsecureConnection() && clientConfiguration.isValidateHostName()) {
             LOG_DEBUG("Validating hostname for " << serviceUrl.host() << ":" << serviceUrl.port());
             std::string urlHost = isSniProxy_ ? proxyUrl.host() : serviceUrl.host();
-            tlsSocket_->set_verify_callback(ASIO::ssl::rfc2818_verification(urlHost));
+            tlsSocket_->set_verify_callback(ASIO::ssl::host_name_verification(urlHost));
         }
 
         LOG_DEBUG("TLS SNI Host: " << serviceUrl.host());
@@ -270,13 +295,13 @@ ClientConnection::ClientConnection(const std::string& logicalAddress, const std:
 }
 
 ClientConnection::~ClientConnection() {
-    LOG_INFO(cnxString_ << "Destroyed connection to " << logicalAddress_ << "-" << poolIndex_);
+    LOG_INFO(cnxString() << "Destroyed connection to " << logicalAddress_ << "-" << poolIndex_);
 }
 
 void ClientConnection::handlePulsarConnected(const proto::CommandConnected& cmdConnected) {
     if (!cmdConnected.has_server_version()) {
-        LOG_ERROR(cnxString_ << "Server version is not set");
-        close();
+        LOG_ERROR(cnxString() << "Server version is not set");
+        close(Error{ResultConnectError, cnxString() + "Server version is not set"});
         return;
     }
 
@@ -286,28 +311,28 @@ void ClientConnection::handlePulsarConnected(const proto::CommandConnected& cmdC
         LOG_DEBUG("Current max message size is: " << maxMessageSize_);
     }
 
+    if (cmdConnected.has_feature_flags()) {
+        supportsScalableTopics_.store(cmdConnected.feature_flags().supports_scalable_topics(),
+                                      std::memory_order_release);
+    }
+
     Lock lock(mutex_);
 
     if (isClosed()) {
-        LOG_INFO(cnxString_ << "Connection already closed");
+        LOG_INFO(cnxString() << "Connection already closed");
         return;
     }
+    cancelTimer(*connectTimer_);
     state_ = Ready;
-    connectTimeoutTask_->stop();
     serverProtocolVersion_ = cmdConnected.protocol_version();
 
     if (serverProtocolVersion_ >= proto::v1) {
         // Only send keep-alive probes if the broker supports it
         keepAliveTimer_ = executor_->createDeadlineTimer();
         if (keepAliveTimer_) {
-            keepAliveTimer_->expires_from_now(std::chrono::seconds(KeepAliveIntervalInSeconds));
-            auto weakSelf = weak_from_this();
-            keepAliveTimer_->async_wait([weakSelf](const ASIO_ERROR&) {
-                auto self = weakSelf.lock();
-                if (self) {
-                    self->handleKeepAliveTimeout();
-                }
-            });
+            keepAliveTimer_->expires_after(std::chrono::seconds(keepAliveIntervalInSeconds_));
+            keepAliveTimer_->async_wait(
+                [this, self{shared_from_this()}](const ASIO_ERROR& err) { handleKeepAliveTimeout(err); });
         }
     }
 
@@ -327,12 +352,12 @@ void ClientConnection::startConsumerStatsTimer(std::vector<uint64_t> consumerSta
     for (int i = 0; i < consumerStatsRequests.size(); i++) {
         PendingConsumerStatsMap::iterator it = pendingConsumerStatsMap_.find(consumerStatsRequests[i]);
         if (it != pendingConsumerStatsMap_.end()) {
-            LOG_DEBUG(cnxString_ << " removing request_id " << it->first
-                                 << " from the pendingConsumerStatsMap_");
+            LOG_DEBUG(cnxString() << " removing request_id " << it->first
+                                  << " from the pendingConsumerStatsMap_");
             consumerStatsPromises.push_back(it->second);
             pendingConsumerStatsMap_.erase(it);
         } else {
-            LOG_DEBUG(cnxString_ << "request_id " << it->first << " already fulfilled - not removing it");
+            LOG_DEBUG(cnxString() << "request_id " << it->first << " already fulfilled - not removing it");
         }
     }
 
@@ -345,20 +370,17 @@ void ClientConnection::startConsumerStatsTimer(std::vector<uint64_t> consumerSta
     // If the close operation has reset the consumerStatsRequestTimer_ then the use_count will be zero
     // Check if we have a timer still before we set the request timer to pop again.
     if (consumerStatsRequestTimer_) {
-        consumerStatsRequestTimer_->expires_from_now(operationsTimeout_);
-        auto weakSelf = weak_from_this();
-        consumerStatsRequestTimer_->async_wait([weakSelf, consumerStatsRequests](const ASIO_ERROR& err) {
-            auto self = weakSelf.lock();
-            if (self) {
-                self->handleConsumerStatsTimeout(err, consumerStatsRequests);
-            }
-        });
+        consumerStatsRequestTimer_->expires_after(operationsTimeout_);
+        consumerStatsRequestTimer_->async_wait(
+            [this, self{shared_from_this()}, consumerStatsRequests](const ASIO_ERROR& err) {
+                handleConsumerStatsTimeout(err, consumerStatsRequests);
+            });
     }
     lock.unlock();
     // Complex logic since promises need to be fulfilled outside the lock
     for (int i = 0; i < consumerStatsPromises.size(); i++) {
         consumerStatsPromises[i].setFailed(ResultTimeout);
-        LOG_WARN(cnxString_ << " Operation timedout, didn't get response from broker");
+        LOG_WARN(cnxString() << " Operation timedout, didn't get response from broker");
     }
 }
 
@@ -385,29 +407,29 @@ typedef ASIO::detail::socket_option::integer<IPPROTO_TCP, TCP_KEEPIDLE> tcp_keep
  *  if async_connect without any error, connected_ would be set to true
  *  at this point the connection is deemed valid to be used by clients of this class
  */
-void ClientConnection::handleTcpConnected(const ASIO_ERROR& err, tcp::resolver::iterator endpointIterator) {
+void ClientConnection::handleTcpConnected(const ASIO_ERROR& err, const tcp::endpoint& endpoint) {
     if (!err) {
         std::stringstream cnxStringStream;
         try {
             cnxStringStream << "[" << socket_->local_endpoint() << " -> " << socket_->remote_endpoint()
                             << "] ";
-            cnxString_ = cnxStringStream.str();
+            std::atomic_store(&cnxStringPtr_, std::make_shared<std::string>(cnxStringStream.str()));
         } catch (const ASIO_SYSTEM_ERROR& e) {
             LOG_ERROR("Failed to get endpoint: " << e.what());
-            close(ResultRetryable);
+            close(Error{ResultRetryable, ""});
             return;
         }
         if (logicalAddress_ == physicalAddress_) {
-            LOG_INFO(cnxString_ << "Connected to broker");
+            LOG_INFO(cnxString() << "Connected to broker");
         } else {
-            LOG_INFO(cnxString_ << "Connected to broker through proxy. Logical broker: " << logicalAddress_
-                                << ", proxy: " << proxyServiceUrl_
-                                << ", physical address:" << physicalAddress_);
+            LOG_INFO(cnxString() << "Connected to broker through proxy. Logical broker: " << logicalAddress_
+                                 << ", proxy: " << proxyServiceUrl_
+                                 << ", physical address:" << physicalAddress_);
         }
 
         Lock lock(mutex_);
         if (isClosed()) {
-            LOG_INFO(cnxString_ << "Connection already closed");
+            LOG_INFO(cnxString() << "Connection already closed");
             return;
         }
         state_ = TcpConnected;
@@ -416,12 +438,12 @@ void ClientConnection::handleTcpConnected(const ASIO_ERROR& err, tcp::resolver::
         ASIO_ERROR error;
         socket_->set_option(tcp::no_delay(true), error);
         if (error) {
-            LOG_WARN(cnxString_ << "Socket failed to set tcp::no_delay: " << error.message());
+            LOG_WARN(cnxString() << "Socket failed to set tcp::no_delay: " << error.message());
         }
 
         socket_->set_option(tcp::socket::keep_alive(true), error);
         if (error) {
-            LOG_WARN(cnxString_ << "Socket failed to set tcp::socket::keep_alive: " << error.message());
+            LOG_WARN(cnxString() << "Socket failed to set tcp::socket::keep_alive: " << error.message());
         }
 
         // Start TCP keep-alive probes after connection has been idle after 1 minute. Ideally this
@@ -429,19 +451,19 @@ void ClientConnection::handleTcpConnected(const ASIO_ERROR& err, tcp::resolver::
         // connection) every 30 seconds
         socket_->set_option(tcp_keep_alive_idle(1 * 60), error);
         if (error) {
-            LOG_DEBUG(cnxString_ << "Socket failed to set tcp_keep_alive_idle: " << error.message());
+            LOG_DEBUG(cnxString() << "Socket failed to set tcp_keep_alive_idle: " << error.message());
         }
 
         // Send up to 10 probes before declaring the connection broken
         socket_->set_option(tcp_keep_alive_count(10), error);
         if (error) {
-            LOG_DEBUG(cnxString_ << "Socket failed to set tcp_keep_alive_count: " << error.message());
+            LOG_DEBUG(cnxString() << "Socket failed to set tcp_keep_alive_count: " << error.message());
         }
 
         // Interval between probes: 6 seconds
         socket_->set_option(tcp_keep_alive_interval(6), error);
         if (error) {
-            LOG_DEBUG(cnxString_ << "Socket failed to set tcp_keep_alive_interval: " << error.message());
+            LOG_DEBUG(cnxString() << "Socket failed to set tcp_keep_alive_interval: " << error.message());
         }
 
         if (tlsSocket_) {
@@ -449,81 +471,63 @@ void ClientConnection::handleTcpConnected(const ASIO_ERROR& err, tcp::resolver::
                 ASIO_ERROR err;
                 Url service_url;
                 if (!Url::parse(physicalAddress_, service_url)) {
-                    LOG_ERROR(cnxString_ << "Invalid Url, unable to parse: " << err << " " << err.message());
-                    close();
+                    LOG_ERROR(cnxString() << "Invalid Url, unable to parse: " << err << " " << err.message());
+                    close(Error{ResultConnectError, "Invalid Url, unable to parse: " + err.message()});
                     return;
                 }
             }
-            auto weakSelf = weak_from_this();
-            auto socket = socket_;
-            auto tlsSocket = tlsSocket_;
             // socket and ssl::stream objects must exist until async_handshake is done, otherwise segmentation
             // fault might happen
-            auto callback = [weakSelf, socket, tlsSocket](const ASIO_ERROR& err) {
-                auto self = weakSelf.lock();
-                if (self) {
-                    self->handleHandshake(err);
-                }
-            };
-            tlsSocket_->async_handshake(ASIO::ssl::stream<tcp::socket>::client,
-                                        ASIO::bind_executor(strand_, callback));
+            tlsSocket_->async_handshake(
+                ASIO::ssl::stream<tcp::socket>::client,
+                [this, self{shared_from_this()}](const auto& err) { handleHandshake(err); });
         } else {
             handleHandshake(ASIO_SUCCESS);
         }
-    } else if (endpointIterator != tcp::resolver::iterator()) {
-        LOG_WARN(cnxString_ << "Failed to establish connection: " << err.message());
-        // The connection failed. Try the next endpoint in the list.
-        ASIO_ERROR closeError;
-        socket_->close(closeError);  // ignore the error of close
-        if (closeError) {
-            LOG_WARN(cnxString_ << "Failed to close socket: " << err.message());
-        }
-        connectTimeoutTask_->stop();
-        ++endpointIterator;
-        if (endpointIterator != tcp::resolver::iterator()) {
-            LOG_DEBUG(cnxString_ << "Connecting to " << endpointIterator->endpoint() << "...");
-            connectTimeoutTask_->start();
-            tcp::endpoint endpoint = *endpointIterator;
-            auto weakSelf = weak_from_this();
-            socket_->async_connect(endpoint, [weakSelf, endpointIterator](const ASIO_ERROR& err) {
-                auto self = weakSelf.lock();
-                if (self) {
-                    self->handleTcpConnected(err, endpointIterator);
-                }
-            });
-        } else {
-            if (err == ASIO::error::operation_aborted) {
-                // TCP connect timeout, which is not retryable
-                close();
-            } else {
-                close(ResultRetryable);
-            }
-        }
     } else {
-        LOG_ERROR(cnxString_ << "Failed to establish connection: " << err.message());
-        close(ResultRetryable);
+        LOG_ERROR(cnxString() << "Failed to establish connection to " << endpoint << ": " << err.message());
+        {
+            std::lock_guard lock{mutex_};
+            if (isClosed()) {
+                return;
+            }
+            cancelTimer(*connectTimer_);
+        }
+        if (err == ASIO::error::operation_aborted) {
+            close(Error{ResultConnectError, "Connection attempt was canceled"});
+        } else {
+            close(Error{ResultRetryable, ""});
+        }
     }
 }
 
 void ClientConnection::handleHandshake(const ASIO_ERROR& err) {
     if (err) {
         if (err.value() == ASIO::ssl::error::stream_truncated) {
-            LOG_WARN(cnxString_ << "Handshake failed: " << err.message());
-            close(ResultRetryable);
+            LOG_WARN(cnxString() << "Handshake failed: " << err.message());
+            close(Error{ResultRetryable, ""});
         } else {
-            LOG_ERROR(cnxString_ << "Handshake failed: " << err.message());
-            close();
+            LOG_ERROR(cnxString() << "Handshake failed: " << err.message());
+            close(Error{ResultConnectError, "Handshake failed: " + err.message()});
         }
         return;
     }
 
     bool connectingThroughProxy = logicalAddress_ != physicalAddress_;
     Result result = ResultOk;
-    SharedBuffer buffer = Commands::newConnect(authentication_, logicalAddress_, connectingThroughProxy,
-                                               clientVersion_, result);
+    SharedBuffer buffer;
+    try {
+        // TODO: pass error instead of result
+        buffer = Commands::newConnect(authentication_, logicalAddress_, connectingThroughProxy,
+                                      clientVersion_, result);
+    } catch (const std::exception& e) {
+        LOG_ERROR(cnxString() << "Failed to create Connect command: " << e.what());
+        close(Error{ResultAuthenticationError, "Failed to create Connect command: " + std::string(e.what())});
+        return;
+    }
     if (result != ResultOk) {
-        LOG_ERROR(cnxString_ << "Failed to establish connection: " << result);
-        close(result);
+        LOG_ERROR(cnxString() << "Failed to establish connection: " << result);
+        close(Error{result, ""});
         return;
     }
     // Send CONNECT command to broker
@@ -539,8 +543,8 @@ void ClientConnection::handleSentPulsarConnect(const ASIO_ERROR& err, const Shar
         return;
     }
     if (err) {
-        LOG_ERROR(cnxString_ << "Failed to establish connection: " << err.message());
-        close();
+        LOG_ERROR(cnxString() << "Failed to establish connection: " << err.message());
+        close(Error{ResultConnectError, "Failed to establish connection: " + err.message()});
         return;
     }
 
@@ -553,8 +557,8 @@ void ClientConnection::handleSentAuthResponse(const ASIO_ERROR& err, const Share
         return;
     }
     if (err) {
-        LOG_WARN(cnxString_ << "Failed to send auth response: " << err.message());
-        close();
+        LOG_WARN(cnxString() << "Failed to send auth response: " << err.message());
+        close(Error{ResultRetryable, "Failed to send auth response: " + err.message()});
         return;
     }
 }
@@ -574,73 +578,67 @@ void ClientConnection::tcpConnectAsync() {
     Url service_url;
     std::string hostUrl = isSniProxy_ ? proxyServiceUrl_ : physicalAddress_;
     if (!Url::parse(hostUrl, service_url)) {
-        LOG_ERROR(cnxString_ << "Invalid Url, unable to parse: " << err << " " << err.message());
-        close();
+        LOG_ERROR(cnxString() << "Invalid Url, unable to parse: " << err << " " << err.message());
+        close(Error{ResultConnectError, "Invalid Url, unable to parse: " + err.message()});
         return;
     }
 
     if (service_url.protocol() != "pulsar" && service_url.protocol() != "pulsar+ssl") {
-        LOG_ERROR(cnxString_ << "Invalid Url protocol '" << service_url.protocol()
-                             << "'. Valid values are 'pulsar' and 'pulsar+ssl'");
-        close();
+        LOG_ERROR(cnxString() << "Invalid Url protocol '" << service_url.protocol()
+                              << "'. Valid values are 'pulsar' and 'pulsar+ssl'");
+        close(Error{ResultConnectError, "Invalid Url protocol '" + service_url.protocol() +
+                                            "'. Valid values are 'pulsar' and 'pulsar+ssl'"});
         return;
     }
 
-    LOG_DEBUG(cnxString_ << "Resolving " << service_url.host() << ":" << service_url.port());
-    tcp::resolver::query query(service_url.host(), std::to_string(service_url.port()));
-    auto weakSelf = weak_from_this();
-    resolver_->async_resolve(query, [weakSelf](const ASIO_ERROR& err, tcp::resolver::iterator iterator) {
-        auto self = weakSelf.lock();
-        if (self) {
-            self->handleResolve(err, iterator);
-        }
-    });
+    LOG_DEBUG(cnxString() << "Resolving " << service_url.host() << ":" << service_url.port());
+
+    resolver_->async_resolve(
+        service_url.host(), std::to_string(service_url.port()),
+        [this, self{shared_from_this()}](auto err, const auto& results) { handleResolve(err, results); });
 }
 
-void ClientConnection::handleResolve(const ASIO_ERROR& err, tcp::resolver::iterator endpointIterator) {
+void ClientConnection::handleResolve(ASIO_ERROR err, const tcp::resolver::results_type& results) {
     if (err) {
-        std::string hostUrl = isSniProxy_ ? cnxString_ : proxyServiceUrl_;
+        std::string hostUrl = isSniProxy_ ? cnxString() : proxyServiceUrl_;
         LOG_ERROR(hostUrl << "Resolve error: " << err << " : " << err.message());
-        close();
+        close(Error{ResultConnectError, hostUrl + " Resolve error: " + err.message()});
         return;
     }
 
-    auto weakSelf = weak_from_this();
-    connectTimeoutTask_->setCallback([weakSelf](const PeriodicTask::ErrorCode& ec) {
-        ClientConnectionPtr ptr = weakSelf.lock();
-        if (!ptr) {
-            // Connection was already destroyed
+    if (!results.empty()) {
+        LOG_DEBUG(cnxString() << "Resolved " << results.size() << " endpoints");
+        for (const auto& entry : results) {
+            const auto& ep = entry.endpoint();
+            LOG_DEBUG(cnxString() << "  " << ep.address().to_string() << ":" << ep.port());
+        }
+    }
+
+    std::lock_guard lock{mutex_};
+    if (isClosed()) {
+        return;
+    }
+
+    connectTimer_->expires_after(connectTimeout_);
+    connectTimer_->async_wait([this, results, self{shared_from_this()}](const auto& err) {
+        if (err) {
             return;
         }
-
-        if (ptr->state_ != Ready) {
-            LOG_ERROR(ptr->cnxString_ << "Connection was not established in "
-                                      << ptr->connectTimeoutTask_->getPeriodMs() << " ms, close the socket");
-            PeriodicTask::ErrorCode err;
-            ptr->socket_->close(err);
-            if (err) {
-                LOG_WARN(ptr->cnxString_ << "Failed to close socket: " << err.message());
-            }
-        }
-        ptr->connectTimeoutTask_->stop();
+        Lock lock{mutex_};
+        if (!isClosed() && state_ != Ready) {
+            LOG_ERROR(cnxString() << "Connection to " << results << " was not established in "
+                                  << connectTimeout_.count() << " ms");
+            lock.unlock();
+            close(Error{ResultConnectError, "Connection was not established in " +
+                                                std::to_string(connectTimeout_.count()) + " ms"});
+        }  // else: the connection is closed or already established
     });
 
-    LOG_DEBUG(cnxString_ << "Connecting to " << endpointIterator->endpoint() << "...");
-    connectTimeoutTask_->start();
-    if (endpointIterator != tcp::resolver::iterator()) {
-        LOG_DEBUG(cnxString_ << "Resolved hostname " << endpointIterator->host_name()  //
-                             << " to " << endpointIterator->endpoint());
-        socket_->async_connect(*endpointIterator, [weakSelf, endpointIterator](const ASIO_ERROR& err) {
-            auto self = weakSelf.lock();
-            if (self) {
-                self->handleTcpConnected(err, endpointIterator);
-            }
+    ASIO::async_connect(
+        *socket_, results,
+        [this, self{shared_from_this()}](const ASIO_ERROR& err, const tcp::endpoint& endpoint) {
+            handleTcpConnected(err, endpoint);
         });
-    } else {
-        LOG_WARN(cnxString_ << "No IP address found");
-        close();
-        return;
-    }
 }
 
 void ClientConnection::readNextCommand() {
@@ -661,13 +659,13 @@ void ClientConnection::handleRead(const ASIO_ERROR& err, size_t bytesTransferred
 
     if (err || bytesTransferred == 0) {
         if (err == ASIO::error::operation_aborted) {
-            LOG_DEBUG(cnxString_ << "Read operation was canceled: " << err.message());
+            LOG_DEBUG(cnxString() << "Read operation was canceled: " << err.message());
         } else if (bytesTransferred == 0 || err == ASIO::error::eof) {
-            LOG_DEBUG(cnxString_ << "Server closed the connection: " << err.message());
+            LOG_DEBUG(cnxString() << "Server closed the connection: " << err.message());
         } else {
-            LOG_ERROR(cnxString_ << "Read operation failed: " << err.message());
+            LOG_ERROR(cnxString() << "Read operation failed: " << err.message());
         }
-        close(ResultDisconnected);
+        close(Error{ResultDisconnected, ""});
     } else if (bytesTransferred < minReadSize) {
         // Read the remaining part, use a slice of buffer to write on the next
         // region
@@ -695,9 +693,9 @@ void ClientConnection::processIncomingBuffer() {
         // otherwise four bytes advertising a 4 GiB frame would make the client allocate 4 GiB.
         // A frame contains at least the size of the command.
         if (frameSize < sizeof(uint32_t) || frameSize > getMaxFrameSize()) {
-            LOG_ERROR(cnxString_ << "Received a frame of invalid size " << frameSize << " (the limit is "
+            LOG_ERROR(cnxString() << "Received a frame of invalid size " << frameSize << " (the limit is "
                                  << getMaxFrameSize() << ")");
-            close(ResultDisconnected);
+            close(Error{ResultDisconnected, "Received a frame of invalid size"});
             return;
         }
 
@@ -716,9 +714,9 @@ void ClientConnection::processIncomingBuffer() {
                     incomingBuffer_ = SharedBuffer::copyFrom(incomingBuffer_, newBufferSize);
                 } catch (const std::exception& e) {
                     // An allocation failure must not escape the executor thread.
-                    LOG_ERROR(cnxString_ << "Failed to allocate a buffer of " << newBufferSize
+                    LOG_ERROR(cnxString() << "Failed to allocate a buffer of " << newBufferSize
                                          << " bytes for an incoming frame: " << e.what());
-                    close(ResultDisconnected);
+                    close(Error{ResultDisconnected, "Failed to allocate a buffer for an incoming frame"});
                     return;
                 }
             }
@@ -735,8 +733,8 @@ void ClientConnection::processIncomingBuffer() {
         // Every length embedded into the frame is validated against the rest of the frame before it is
         // used, so that a malformed frame can not make the parser read beyond it.
         auto closeOnMalformedFrame = [this](const char* reason) {
-            LOG_ERROR(cnxString_ << "Received a malformed frame: " << reason);
-            close(ResultDisconnected);
+            LOG_ERROR(cnxString() << "Received a malformed frame: " << reason);
+            close(Error{ResultDisconnected, std::string("Received a malformed frame: ") + reason});
         };
 
         uint32_t cmdSize = incomingBuffer_.readUnsignedInt();
@@ -749,8 +747,8 @@ void ClientConnection::processIncomingBuffer() {
 
         proto::BaseCommand incomingCmd;
         if (!incomingCmd.ParseFromArray(incomingBuffer_.data(), cmdSize)) {
-            LOG_ERROR(cnxString_ << "Error parsing protocol buffer command");
-            close(ResultDisconnected);
+            LOG_ERROR(cnxString() << "Error parsing protocol buffer command");
+            close(Error{ResultDisconnected, ""});
             return;
         }
 
@@ -780,12 +778,12 @@ void ClientConnection::processIncomingBuffer() {
                     return;
                 }
                 if (!brokerEntryMetadata.ParseFromArray(incomingBuffer_.data(), brokerEntryMetadataSize)) {
-                    LOG_ERROR(cnxString_ << "[consumer id " << incomingCmd.message().consumer_id()
-                                         << ", message ledger id "
-                                         << incomingCmd.message().message_id().ledgerid() << ", entry id "
-                                         << incomingCmd.message().message_id().entryid()
-                                         << "] Error parsing broker entry metadata");
-                    close(ResultDisconnected);
+                    LOG_ERROR(cnxString()
+                              << "[consumer id " << incomingCmd.message().consumer_id()
+                              << ", message ledger id " << incomingCmd.message().message_id().ledgerid()
+                              << ", entry id " << incomingCmd.message().message_id().entryid()
+                              << "] Error parsing broker entry metadata");
+                    close(Error{ResultDisconnected, ""});
                     return;
                 }
                 incomingBuffer_.setReaderIndex(readerIndex + 2 + 4 + brokerEntryMetadataSize);
@@ -817,12 +815,12 @@ void ClientConnection::processIncomingBuffer() {
                 return;
             }
             if (!msgMetadata.ParseFromArray(incomingBuffer_.data(), metadataSize)) {
-                LOG_ERROR(cnxString_ << "[consumer id " << incomingCmd.message().consumer_id()  //
-                                     << ", message ledger id "
-                                     << incomingCmd.message().message_id().ledgerid()  //
-                                     << ", entry id " << incomingCmd.message().message_id().entryid()
-                                     << "] Error parsing message metadata");
-                close(ResultDisconnected);
+                LOG_ERROR(cnxString()
+                          << "[consumer id " << incomingCmd.message().consumer_id()                   //
+                          << ", message ledger id " << incomingCmd.message().message_id().ledgerid()  //
+                          << ", entry id " << incomingCmd.message().message_id().entryid()
+                          << "] Error parsing message metadata");
+                close(Error{ResultDisconnected, ""});
                 return;
             }
 
@@ -896,8 +894,8 @@ bool ClientConnection::verifyChecksum(SharedBuffer& incomingBuffer_, uint32_t& r
 }
 
 void ClientConnection::handleActiveConsumerChange(const proto::CommandActiveConsumerChange& change) {
-    LOG_DEBUG(cnxString_ << "Received notification about active consumer change, consumer_id: "
-                         << change.consumer_id() << " isActive: " << change.is_active());
+    LOG_DEBUG(cnxString() << "Received notification about active consumer change, consumer_id: "
+                          << change.consumer_id() << " isActive: " << change.is_active());
     Lock lock(mutex_);
     ConsumersMap::iterator it = consumers_.find(change.consumer_id());
     if (it != consumers_.end()) {
@@ -908,19 +906,40 @@ void ClientConnection::handleActiveConsumerChange(const proto::CommandActiveCons
             consumer->activeConsumerChanged(change.is_active());
         } else {
             consumers_.erase(change.consumer_id());
-            LOG_DEBUG(cnxString_ << "Ignoring incoming message for already destroyed consumer "
-                                 << change.consumer_id());
+            LOG_DEBUG(cnxString() << "Ignoring incoming message for already destroyed consumer "
+                                  << change.consumer_id());
         }
     } else {
-        LOG_DEBUG(cnxString_ << "Got invalid consumer Id in " << change.consumer_id()
-                             << " -- isActive: " << change.is_active());
+        LOG_DEBUG(cnxString() << "Got invalid consumer Id in " << change.consumer_id()
+                              << " -- isActive: " << change.is_active());
+    }
+}
+
+void ClientConnection::handleReachedEndOfTopic(const proto::CommandReachedEndOfTopic& reachedEndOfTopic) {
+    LOG_DEBUG(cnxString() << "Received reached-end-of-topic, consumer_id: "
+                          << reachedEndOfTopic.consumer_id());
+    Lock lock(mutex_);
+    ConsumersMap::iterator it = consumers_.find(reachedEndOfTopic.consumer_id());
+    if (it != consumers_.end()) {
+        ConsumerImplPtr consumer = it->second.lock();
+        if (consumer) {
+            lock.unlock();
+            consumer->reachedEndOfTopic();
+        } else {
+            consumers_.erase(reachedEndOfTopic.consumer_id());
+            LOG_DEBUG(cnxString() << "Ignoring reached-end-of-topic for already destroyed consumer "
+                                  << reachedEndOfTopic.consumer_id());
+        }
+    } else {
+        LOG_DEBUG(cnxString() << "Got invalid consumer Id in reached-end-of-topic "
+                              << reachedEndOfTopic.consumer_id());
     }
 }
 
 void ClientConnection::handleIncomingMessage(const proto::CommandMessage& msg, bool isChecksumValid,
                                              proto::BrokerEntryMetadata& brokerEntryMetadata,
                                              proto::MessageMetadata& msgMetadata, SharedBuffer& payload) {
-    LOG_DEBUG(cnxString_ << "Received a message from the server for consumer: " << msg.consumer_id());
+    LOG_DEBUG(cnxString() << "Received a message from the server for consumer: " << msg.consumer_id());
 
     Lock lock(mutex_);
     ConsumersMap::iterator it = consumers_.find(msg.consumer_id());
@@ -935,21 +954,21 @@ void ClientConnection::handleIncomingMessage(const proto::CommandMessage& msg, b
                                       msgMetadata, payload);
         } else {
             consumers_.erase(msg.consumer_id());
-            LOG_DEBUG(cnxString_ << "Ignoring incoming message for already destroyed consumer "
-                                 << msg.consumer_id());
+            LOG_DEBUG(cnxString() << "Ignoring incoming message for already destroyed consumer "
+                                  << msg.consumer_id());
         }
     } else {
-        LOG_DEBUG(cnxString_ << "Got invalid consumer Id in "  //
-                             << msg.consumer_id() << " -- msg: " << msgMetadata.sequence_id());
+        LOG_DEBUG(cnxString() << "Got invalid consumer Id in "  //
+                              << msg.consumer_id() << " -- msg: " << msgMetadata.sequence_id());
     }
 }
 
 void ClientConnection::handleIncomingCommand(BaseCommand& incomingCmd) {
-    LOG_DEBUG(cnxString_ << "Handling incoming command: " << Commands::messageType(incomingCmd.type()));
+    LOG_DEBUG(cnxString() << "Handling incoming command: " << Commands::messageType(incomingCmd.type()));
 
     switch (state_.load()) {
         case Pending: {
-            LOG_ERROR(cnxString_ << "Connection is not ready yet");
+            LOG_ERROR(cnxString() << "Connection is not ready yet");
             break;
         }
 
@@ -957,7 +976,8 @@ void ClientConnection::handleIncomingCommand(BaseCommand& incomingCmd) {
             // Handle Pulsar Connected
             if (incomingCmd.type() != BaseCommand::CONNECTED) {
                 // Wrong cmd
-                close();
+                close(Error{ResultDisconnected, cnxString() + "Expected CONNECTED command but received " +
+                                                    Commands::messageType(incomingCmd.type())});
             } else {
                 handlePulsarConnected(incomingCmd.connected());
             }
@@ -965,14 +985,16 @@ void ClientConnection::handleIncomingCommand(BaseCommand& incomingCmd) {
         }
 
         case Disconnected: {
-            LOG_ERROR(cnxString_ << "Connection already disconnected");
+            LOG_ERROR(cnxString() << "Connection already disconnected");
             break;
         }
 
         case Ready: {
             // Since we are receiving data from the connection, we are assuming that for now the
             // connection is still working well.
-            havePendingPingRequest_ = false;
+            if (incomingCmd.type() != BaseCommand::PING) {
+                havePendingPingRequest_ = false;
+            }
 
             // Handle normal commands
             switch (incomingCmd.type()) {
@@ -1022,12 +1044,12 @@ void ClientConnection::handleIncomingCommand(BaseCommand& incomingCmd) {
 
                 case BaseCommand::PING:
                     // Respond to ping request
-                    LOG_DEBUG(cnxString_ << "Replying to ping command");
+                    LOG_DEBUG(cnxString() << "Replying to ping command");
                     sendCommand(Commands::newPong());
                     break;
 
                 case BaseCommand::PONG:
-                    LOG_DEBUG(cnxString_ << "Received response to ping message");
+                    LOG_DEBUG(cnxString() << "Received response to ping message");
                     break;
 
                 case BaseCommand::AUTH_CHALLENGE:
@@ -1054,9 +1076,17 @@ void ClientConnection::handleIncomingCommand(BaseCommand& incomingCmd) {
                     handleAckResponse(incomingCmd.ackresponse());
                     break;
 
+                case BaseCommand::SCALABLE_TOPIC_UPDATE:
+                    handleScalableTopicUpdate(incomingCmd.scalabletopicupdate());
+                    break;
+
+                case BaseCommand::REACHED_END_OF_TOPIC:
+                    handleReachedEndOfTopic(incomingCmd.reachedendoftopic());
+                    break;
+
                 default:
-                    LOG_WARN(cnxString_ << "Received invalid message from server");
-                    close(ResultDisconnected);
+                    LOG_WARN(cnxString() << "Received invalid message from server");
+                    close(Error{ResultDisconnected, cnxString() + "Received invalid message from server"});
                     break;
             }
         }
@@ -1069,55 +1099,70 @@ Future<Result, BrokerConsumerStatsImpl> ClientConnection::newConsumerStats(uint6
     Promise<Result, BrokerConsumerStatsImpl> promise;
     if (isClosed()) {
         lock.unlock();
-        LOG_ERROR(cnxString_ << " Client is not connected to the broker");
+        LOG_ERROR(cnxString() << " Client is not connected to the broker");
         promise.setFailed(ResultNotConnected);
+        return promise.getFuture();
     }
     pendingConsumerStatsMap_.insert(std::make_pair(requestId, promise));
     lock.unlock();
+    if (mockingRequests_.load(std::memory_order_acquire) && mockServer_ != nullptr &&
+        mockServer_->sendRequest("CONSUMER_STATS", requestId)) {
+        return promise.getFuture();
+    }
     sendCommand(Commands::newConsumerStats(consumerId, requestId));
     return promise.getFuture();
 }
 
 void ClientConnection::newTopicLookup(const std::string& topicName, bool authoritative,
-                                      const std::string& listenerName, const uint64_t requestId,
-                                      LookupDataResultPromisePtr promise) {
-    newLookup(Commands::newLookup(topicName, authoritative, requestId, listenerName), requestId, promise);
+                                      const std::string& listenerName, uint64_t requestId,
+                                      const LookupDataResultPromisePtr& promise) {
+    newLookup(Commands::newLookup(topicName, authoritative, requestId, listenerName), requestId, "LOOKUP",
+              promise);
 }
 
-void ClientConnection::newPartitionedMetadataLookup(const std::string& topicName, const uint64_t requestId,
-                                                    LookupDataResultPromisePtr promise) {
-    newLookup(Commands::newPartitionMetadataRequest(topicName, requestId), requestId, promise);
+void ClientConnection::newPartitionedMetadataLookup(const std::string& topicName, uint64_t requestId,
+                                                    const LookupDataResultPromisePtr& promise) {
+    newLookup(Commands::newPartitionMetadataRequest(topicName, requestId), requestId, "PARTITIONED_METADATA",
+              promise);
 }
 
-void ClientConnection::newLookup(const SharedBuffer& cmd, const uint64_t requestId,
-                                 LookupDataResultPromisePtr promise) {
+void ClientConnection::newLookup(const SharedBuffer& cmd, uint64_t requestId, const char* requestType,
+                                 const LookupDataResultPromisePtr& promise) {
     Lock lock(mutex_);
-    std::shared_ptr<LookupDataResultPtr> lookupDataResult;
-    lookupDataResult = std::make_shared<LookupDataResultPtr>();
     if (isClosed()) {
         lock.unlock();
-        promise->setFailed(ResultNotConnected);
+        promise->setFailed(Error{ResultNotConnected, ""});
         return;
     } else if (numOfPendingLookupRequest_ >= maxPendingLookupRequest_) {
         lock.unlock();
-        promise->setFailed(ResultTooManyLookupRequestException);
+        promise->setFailed(Error{ResultTooManyLookupRequestException, ""});
         return;
     }
-    LookupRequestData requestData;
-    requestData.promise = promise;
-    requestData.timer = executor_->createDeadlineTimer();
-    requestData.timer->expires_from_now(operationsTimeout_);
-    auto weakSelf = weak_from_this();
-    requestData.timer->async_wait([weakSelf, requestData](const ASIO_ERROR& ec) {
-        auto self = weakSelf.lock();
-        if (self) {
-            self->handleLookupTimeout(ec, requestData);
-        }
-    });
 
-    pendingLookupRequests_.insert(std::make_pair(requestId, requestData));
+    auto request = insertRequest(
+        pendingLookupRequests_, requestId, [weakSelf{weak_from_this()}, requestId, requestType]() {
+            if (auto self = weakSelf.lock()) {
+                LOG_WARN(self->cnxString()
+                         << requestType << " request timeout to broker, req_id: " << requestId);
+                self->numOfPendingLookupRequest_--;
+            }
+        });
+    request->getFuture().addListener(
+        [promise](const auto& error, const LookupDataResultPtr& lookupDataResult) {
+            if (error.result == ResultOk) {
+                promise->setValue(lookupDataResult);
+            } else {
+                promise->setFailed(error);
+            }
+        });
+
     numOfPendingLookupRequest_++;
     lock.unlock();
+    LOG_DEBUG(cnxString() << "Inserted lookup request " << requestType << " (req_id: " << requestId << ")");
+    if (mockingRequests_.load(std::memory_order_acquire) && mockServer_ != nullptr &&
+        mockServer_->sendRequest(requestType, requestId)) {
+        return;
+    }
     sendCommand(cmd);
 }
 
@@ -1126,18 +1171,7 @@ void ClientConnection::sendCommand(const SharedBuffer& cmd) {
 
     if (pendingWriteOperations_++ == 0) {
         // Write immediately to socket
-        if (tlsSocket_) {
-            auto weakSelf = weak_from_this();
-            auto callback = [weakSelf, cmd]() {
-                auto self = weakSelf.lock();
-                if (self) {
-                    self->sendCommandInternal(cmd);
-                }
-            };
-            ASIO::post(strand_, callback);
-        } else {
-            sendCommandInternal(cmd);
-        }
+        executor_->dispatch([this, cmd, self{shared_from_this()}] { sendCommandInternal(cmd); });
     } else {
         // Queue to send later
         pendingWriteBuffers_.push_back(cmd);
@@ -1169,11 +1203,7 @@ void ClientConnection::sendMessage(const std::shared_ptr<SendArguments>& args) {
                                    handleSendPair(err);
                                }));
     };
-    if (tlsSocket_) {
-        ASIO::post(strand_, sendMessageInternal);
-    } else {
-        sendMessageInternal();
-    }
+    executor_->dispatch(sendMessageInternal);
 }
 
 void ClientConnection::handleSend(const ASIO_ERROR& err, const SharedBuffer&) {
@@ -1181,8 +1211,8 @@ void ClientConnection::handleSend(const ASIO_ERROR& err, const SharedBuffer&) {
         return;
     }
     if (err) {
-        LOG_WARN(cnxString_ << "Could not send message on connection: " << err << " " << err.message());
-        close(ResultDisconnected);
+        LOG_WARN(cnxString() << "Could not send message on connection: " << err << " " << err.message());
+        close(Error{ResultDisconnected, ""});
     } else {
         sendPendingCommands();
     }
@@ -1193,8 +1223,8 @@ void ClientConnection::handleSendPair(const ASIO_ERROR& err) {
         return;
     }
     if (err) {
-        LOG_WARN(cnxString_ << "Could not send pair message on connection: " << err << " " << err.message());
-        close(ResultDisconnected);
+        LOG_WARN(cnxString() << "Could not send pair message on connection: " << err << " " << err.message());
+        close(Error{ResultDisconnected, ""});
     } else {
         sendPendingCommands();
     }
@@ -1205,19 +1235,19 @@ void ClientConnection::sendPendingCommands() {
 
     if (--pendingWriteOperations_ > 0) {
         assert(!pendingWriteBuffers_.empty());
-        boost::any any = pendingWriteBuffers_.front();
+        auto any = pendingWriteBuffers_.front();
         pendingWriteBuffers_.pop_front();
 
         auto self = shared_from_this();
         if (any.type() == typeid(SharedBuffer)) {
-            SharedBuffer buffer = boost::any_cast<SharedBuffer>(any);
+            SharedBuffer buffer = std::any_cast<SharedBuffer>(any);
             asyncWrite(buffer.const_asio_buffer(),
                        customAllocWriteHandler(
                            [this, self, buffer](const ASIO_ERROR& err, size_t) { handleSend(err, buffer); }));
         } else {
             assert(any.type() == typeid(std::shared_ptr<SendArguments>));
 
-            auto args = boost::any_cast<std::shared_ptr<SendArguments>>(any);
+            auto args = std::any_cast<std::shared_ptr<SendArguments>>(any);
             BaseCommand outgoingCmd;
             PairSharedBuffer buffer =
                 Commands::newSend(outgoingBuffer_, outgoingCmd, getChecksumType(), *args);
@@ -1234,64 +1264,52 @@ void ClientConnection::sendPendingCommands() {
     }
 }
 
-Future<Result, ResponseData> ClientConnection::sendRequestWithId(SharedBuffer cmd, int requestId) {
+Future<Error, ResponseData> ClientConnection::sendRequestWithId(const SharedBuffer& cmd, int requestId,
+                                                                const char* requestType) {
     Lock lock(mutex_);
 
     if (isClosed()) {
         lock.unlock();
-        Promise<Result, ResponseData> promise;
-        promise.setFailed(ResultNotConnected);
+        LOG_DEBUG(cnxString() << "Fail " << requestType << "(req_id: " << requestId
+                              << ") to a closed connection");
+        Promise<Error, ResponseData> promise;
+        promise.setFailed(Error{ResultNotConnected, ""});
         return promise.getFuture();
     }
 
-    PendingRequestData requestData;
-    requestData.timer = executor_->createDeadlineTimer();
-    requestData.timer->expires_from_now(operationsTimeout_);
-    auto weakSelf = weak_from_this();
-    requestData.timer->async_wait([weakSelf, requestData](const ASIO_ERROR& ec) {
-        auto self = weakSelf.lock();
-        if (self) {
-            self->handleRequestTimeout(ec, requestData);
-        }
-    });
-
-    pendingRequests_.insert(std::make_pair(requestId, requestData));
+    auto request = insertRequest(
+        pendingRequests_, requestId,
+        [cnxString{cnxString()}, physicalAddress{physicalAddress_}, requestId, requestType]() {
+            LOG_WARN(cnxString << "Network request timeout to broker, remote: " << physicalAddress
+                               << ", req_id: " << requestId << ", request: " << requestType);
+        });
     lock.unlock();
 
-    sendCommand(cmd);
-    return requestData.promise.getFuture();
-}
-
-void ClientConnection::handleRequestTimeout(const ASIO_ERROR& ec, PendingRequestData pendingRequestData) {
-    if (!ec && !pendingRequestData.hasGotResponse->load()) {
-        pendingRequestData.promise.setFailed(ResultTimeout);
+    LOG_DEBUG(cnxString() << "Inserted request " << requestType << " (req_id: " << requestId << ")");
+    if (mockingRequests_.load(std::memory_order_acquire)) {
+        if (mockServer_ == nullptr) {
+            LOG_WARN(cnxString() << "Mock server is unexpectedly null when processing " << requestType);
+            sendCommand(cmd);
+        } else if (!mockServer_->sendRequest(requestType, requestId)) {
+            sendCommand(cmd);
+        }
+    } else {
+        sendCommand(cmd);
     }
+    return request->getFuture();
 }
 
-void ClientConnection::handleLookupTimeout(const ASIO_ERROR& ec, LookupRequestData pendingRequestData) {
-    if (!ec) {
-        pendingRequestData.promise->setFailed(ResultTimeout);
-    }
-}
-
-void ClientConnection::handleGetLastMessageIdTimeout(const ASIO_ERROR& ec,
-                                                     ClientConnection::LastMessageIdRequestData data) {
-    if (!ec) {
-        data.promise->setFailed(ResultTimeout);
-    }
-}
-
-void ClientConnection::handleKeepAliveTimeout() {
-    if (isClosed()) {
+void ClientConnection::handleKeepAliveTimeout(const ASIO_ERROR& ec) {
+    if (isClosed() || ec) {
         return;
     }
 
     if (havePendingPingRequest_) {
-        LOG_WARN(cnxString_ << "Forcing connection to close after keep-alive timeout");
-        close(ResultDisconnected);
+        LOG_WARN(cnxString() << "Forcing connection to close after keep-alive timeout");
+        close(Error{ResultDisconnected, ""});
     } else {
         // Send keep alive probe to peer
-        LOG_DEBUG(cnxString_ << "Sending ping message");
+        LOG_DEBUG(cnxString() << "Sending ping message");
         havePendingPingRequest_ = true;
         sendCommand(Commands::newPing());
 
@@ -1299,54 +1317,42 @@ void ClientConnection::handleKeepAliveTimeout() {
         // be zero And we do not attempt to dereference the pointer.
         Lock lock(mutex_);
         if (keepAliveTimer_) {
-            keepAliveTimer_->expires_from_now(std::chrono::seconds(KeepAliveIntervalInSeconds));
-            auto weakSelf = weak_from_this();
-            keepAliveTimer_->async_wait([weakSelf](const ASIO_ERROR&) {
-                auto self = weakSelf.lock();
-                if (self) {
-                    self->handleKeepAliveTimeout();
-                }
-            });
+            keepAliveTimer_->expires_after(std::chrono::seconds(keepAliveIntervalInSeconds_));
+            keepAliveTimer_->async_wait(
+                [this, self{shared_from_this()}](const auto& err) { handleKeepAliveTimeout(err); });
         }
         lock.unlock();
     }
 }
 
 void ClientConnection::handleConsumerStatsTimeout(const ASIO_ERROR& ec,
-                                                  std::vector<uint64_t> consumerStatsRequests) {
+                                                  const std::vector<uint64_t>& consumerStatsRequests) {
     if (ec) {
-        LOG_DEBUG(cnxString_ << " Ignoring timer cancelled event, code[" << ec << "]");
+        LOG_DEBUG(cnxString() << " Ignoring timer cancelled event, code[" << ec << "]");
         return;
     }
     startConsumerStatsTimer(consumerStatsRequests);
 }
 
-void ClientConnection::close(Result result, bool detach) {
+const std::future<void>& ClientConnection::close(Error&& error, bool switchCluster) {
     Lock lock(mutex_);
-    if (isClosed()) {
-        return;
+    if (closeFuture_) {
+        connectPromise_.setFailed(std::move(error));
+        return *closeFuture_;
     }
+    auto promise = std::make_shared<std::promise<void>>();
+    closeFuture_ = promise->get_future();
+    // The atomic update on state_ guarantees the previous modification on closeFuture_ is visible once the
+    // atomic read on state_ returns Disconnected `isClosed()`.
+    // However, it cannot prevent the race like:
+    // 1. thread 1: Check `isClosed()`, which returns false.
+    // 2. thread 2: call `close()`, now, `state_` becomes Disconnected, and `closeFuture_` is set.
+    // 3. thread 1: post the `async_write` to the `io_context`,
+    // 4. io thread: call `socket_->close()`
+    // 5. io thread: execute `async_write` on `socket_`, which has been closed
+    // However, even the race happens, it's still safe because all the socket operations happen in the same
+    // io thread, the `async_write` operation will simply fail with an error, no crash will happen.
     state_ = Disconnected;
-
-    if (socket_) {
-        ASIO_ERROR err;
-        socket_->shutdown(ASIO::socket_base::shutdown_both, err);
-        socket_->close(err);
-        if (err) {
-            LOG_WARN(cnxString_ << "Failed to close socket: " << err.message());
-        }
-    }
-    if (tlsSocket_) {
-        ASIO_ERROR err;
-        tlsSocket_->lowest_layer().close(err);
-        if (err) {
-            LOG_WARN(cnxString_ << "Failed to close TLS socket: " << err.message());
-        }
-    }
-
-    if (executor_) {
-        executor_.reset();
-    }
 
     // Move the internal fields to process them after `mutex_` was unlocked
     auto consumers = std::move(consumers_);
@@ -1357,34 +1363,52 @@ void ClientConnection::close(Result result, bool detach) {
     auto pendingGetLastMessageIdRequests = std::move(pendingGetLastMessageIdRequests_);
     auto pendingGetNamespaceTopicsRequests = std::move(pendingGetNamespaceTopicsRequests_);
     auto pendingGetSchemaRequests = std::move(pendingGetSchemaRequests_);
+    auto scalableTopicSessions = std::move(scalableTopicSessions_);
 
     numOfPendingLookupRequest_ = 0;
 
     if (keepAliveTimer_) {
-        keepAliveTimer_->cancel();
+        cancelTimer(*keepAliveTimer_);
         keepAliveTimer_.reset();
     }
 
     if (consumerStatsRequestTimer_) {
-        consumerStatsRequestTimer_->cancel();
+        cancelTimer(*consumerStatsRequestTimer_);
         consumerStatsRequestTimer_.reset();
     }
 
-    if (connectTimeoutTask_) {
-        connectTimeoutTask_->stop();
-    }
-
+    cancelTimer(*connectTimer_);
     lock.unlock();
     int refCount = weak_from_this().use_count();
-    if (!isResultRetryable(result)) {
-        LOG_ERROR(cnxString_ << "Connection closed with " << result << " (refCnt: " << refCount << ")");
+    auto result = error.result;
+    if (result != ResultAlreadyClosed /* closed by the pool */ && !isResultRetryable(result)) {
+        LOG_ERROR(cnxString() << "Connection closed with " << result << " (refCnt: " << refCount << ")");
     } else {
-        LOG_INFO(cnxString_ << "Connection disconnected (refCnt: " << refCount << ")");
+        LOG_INFO(cnxString() << "Connection disconnected (refCnt: " << refCount << ")");
     }
     // Remove the connection from the pool before completing any promise
-    if (detach) {
-        pool_.remove(logicalAddress_, physicalAddress_, poolIndex_, this);
-    }
+    pool_.remove(logicalAddress_, physicalAddress_, poolIndex_, this);
+
+    // Close the socket after removing itself from the pool so that other requests won't be able to acquire
+    // this connection after the socket is closed.
+    executor_->dispatch([this, promise, self{shared_from_this()}] {
+        // According to asio document, ip::tcp::socket and ssl::stream are unsafe as shared objects, so the
+        // methods must be called within the same implicit or explicit strand.
+        // The implementation of `ExecutorService` guarantees the internal `io_context::run()` is only called
+        // in one thread, so we can safely call the socket methods without posting to a strand instance.
+        ASIO_ERROR err;
+        socket_->shutdown(ASIO::socket_base::shutdown_both, err);
+        socket_->close(err);
+        if (err) {
+            LOG_WARN(cnxString() << "Failed to close socket: " << err.message());
+        }
+        if (tlsSocket_) {
+            auto tlsSocket = tlsSocket_;
+            tlsSocket->async_shutdown([promise, self, tlsSocket](const auto&) { promise->set_value(); });
+        } else {
+            promise->set_value();
+        }
+    });
 
     auto self = shared_from_this();
     for (ProducersMap::iterator it = producers.begin(); it != producers.end(); ++it) {
@@ -1397,47 +1421,52 @@ void ClientConnection::close(Result result, bool detach) {
     for (ConsumersMap::iterator it = consumers.begin(); it != consumers.end(); ++it) {
         auto consumer = it->second.lock();
         if (consumer) {
+            if (switchCluster) {
+                consumer->onClusterSwitching();
+            }
             consumer->handleDisconnection(result, self);
         }
     }
     self.reset();
 
-    connectPromise_.setFailed(result);
+    connectPromise_.setFailed(error);
 
-    // Fail all pending requests, all these type are map whose value type contains the Promise object
+    // Fail all pending requests after releasing the lock.
     for (auto& kv : pendingRequests) {
-        kv.second.promise.setFailed(result);
+        kv.second->fail(error);
     }
     for (auto& kv : pendingLookupRequests) {
-        kv.second.promise->setFailed(result);
+        kv.second->fail(error);
+    }
+    // Notify scalable-topic DAG-watch sessions so they can re-establish on a
+    // new connection.
+    for (auto& kv : scalableTopicSessions) {
+        kv.second(error.result, nullptr);
     }
     for (auto& kv : pendingConsumerStatsMap) {
-        LOG_ERROR(cnxString_ << " Closing Client Connection, please try again later");
+        LOG_ERROR(cnxString() << " Closing Client Connection, please try again later");
         kv.second.setFailed(result);
     }
     for (auto& kv : pendingGetLastMessageIdRequests) {
-        kv.second.promise->setFailed(result);
+        kv.second->fail(error);
     }
     for (auto& kv : pendingGetNamespaceTopicsRequests) {
-        kv.second.setFailed(result);
+        kv.second->fail(error);
     }
     for (auto& kv : pendingGetSchemaRequests) {
-        kv.second.promise.setFailed(result);
+        kv.second->fail(error);
     }
+    return *closeFuture_;
 }
 
 bool ClientConnection::isClosed() const { return state_ == Disconnected; }
 
-Future<Result, ClientConnectionWeakPtr> ClientConnection::getConnectFuture() {
-    return connectPromise_.getFuture();
-}
-
-void ClientConnection::registerProducer(int producerId, ProducerImplPtr producer) {
+void ClientConnection::registerProducer(int producerId, const ProducerImplPtr& producer) {
     Lock lock(mutex_);
     producers_.insert(std::make_pair(producerId, producer));
 }
 
-void ClientConnection::registerConsumer(int consumerId, ConsumerImplPtr consumer) {
+void ClientConnection::registerConsumer(int consumerId, const ConsumerImplPtr& consumer) {
     Lock lock(mutex_);
     consumers_.insert(std::make_pair(consumerId, consumer));
 }
@@ -1452,9 +1481,40 @@ void ClientConnection::removeConsumer(int consumerId) {
     consumers_.erase(consumerId);
 }
 
-const std::string& ClientConnection::brokerAddress() const { return physicalAddress_; }
+bool ClientConnection::registerScalableTopicSession(uint64_t sessionId,
+                                                    ScalableTopicUpdateListener listener) {
+    Lock lock(mutex_);
+    if (isClosed()) {
+        return false;
+    }
+    scalableTopicSessions_[sessionId] = std::move(listener);
+    return true;
+}
 
-const std::string& ClientConnection::cnxString() const { return cnxString_; }
+void ClientConnection::removeScalableTopicSession(uint64_t sessionId) {
+    Lock lock(mutex_);
+    scalableTopicSessions_.erase(sessionId);
+}
+
+void ClientConnection::handleScalableTopicUpdate(const proto::CommandScalableTopicUpdate& update) {
+    ScalableTopicUpdateListener listener;
+    {
+        Lock lock(mutex_);
+        auto it = scalableTopicSessions_.find(update.session_id());
+        if (it != scalableTopicSessions_.end()) {
+            listener = it->second;
+        }
+    }
+    if (listener) {
+        listener(ResultOk, &update);
+    } else {
+        // A push may race with a just-closed session; drop it rather than
+        // treating it as a protocol violation.
+        LOG_WARN(cnxString() << "Received SCALABLE_TOPIC_UPDATE for unknown session " << update.session_id());
+    }
+}
+
+const std::string& ClientConnection::brokerAddress() const { return physicalAddress_; }
 
 int ClientConnection::getServerProtocolVersion() const { return serverProtocolVersion_; }
 
@@ -1474,83 +1534,97 @@ Commands::ChecksumType ClientConnection::getChecksumType() const {
 Future<Result, GetLastMessageIdResponse> ClientConnection::newGetLastMessageId(uint64_t consumerId,
                                                                                uint64_t requestId) {
     Lock lock(mutex_);
-    auto promise = std::make_shared<GetLastMessageIdResponsePromisePtr::element_type>();
     if (isClosed()) {
         lock.unlock();
-        LOG_ERROR(cnxString_ << " Client is not connected to the broker");
+        LOG_ERROR(cnxString() << " Client is not connected to the broker");
+        auto promise = std::make_shared<GetLastMessageIdResponsePromisePtr::element_type>();
         promise->setFailed(ResultNotConnected);
         return promise->getFuture();
     }
 
-    LastMessageIdRequestData requestData;
-    requestData.promise = promise;
-    requestData.timer = executor_->createDeadlineTimer();
-    requestData.timer->expires_from_now(operationsTimeout_);
-    auto weakSelf = weak_from_this();
-    requestData.timer->async_wait([weakSelf, requestData](const ASIO_ERROR& ec) {
-        auto self = weakSelf.lock();
-        if (self) {
-            self->handleGetLastMessageIdTimeout(ec, requestData);
+    auto request =
+        insertRequest(pendingGetLastMessageIdRequests_, requestId, [cnxString = cnxString(), requestId]() {
+            LOG_WARN(cnxString << "GetLastMessageId request timeout to broker, req_id: " << requestId);
+        });
+    lock.unlock();
+
+    // TODO: return Error instead
+    Promise<Result, GetLastMessageIdResponse> promise;
+    request->getFuture().addListener([promise](const auto& error, const auto& response) {
+        if (error.result == ResultOk) {
+            promise.setValue(response);
+        } else {
+            promise.setFailed(error.result);
         }
     });
-    pendingGetLastMessageIdRequests_.insert(std::make_pair(requestId, requestData));
-    lock.unlock();
+    if (mockingRequests_.load(std::memory_order_acquire) && mockServer_ != nullptr &&
+        mockServer_->sendRequest("GET_LAST_MESSAGE_ID", requestId)) {
+        return promise.getFuture();
+    }
     sendCommand(Commands::newGetLastMessageId(consumerId, requestId));
-    return promise->getFuture();
+    return promise.getFuture();
 }
 
 Future<Result, NamespaceTopicsPtr> ClientConnection::newGetTopicsOfNamespace(
     const std::string& nsName, CommandGetTopicsOfNamespace_Mode mode, uint64_t requestId) {
     Lock lock(mutex_);
-    Promise<Result, NamespaceTopicsPtr> promise;
     if (isClosed()) {
         lock.unlock();
-        LOG_ERROR(cnxString_ << "Client is not connected to the broker");
+        LOG_ERROR(cnxString() << "Client is not connected to the broker");
+        Promise<Result, NamespaceTopicsPtr> promise;
         promise.setFailed(ResultNotConnected);
         return promise.getFuture();
     }
 
-    pendingGetNamespaceTopicsRequests_.insert(std::make_pair(requestId, promise));
+    auto request =
+        insertRequest(pendingGetNamespaceTopicsRequests_, requestId, [cnxString = cnxString(), requestId]() {
+            LOG_WARN(cnxString << "GetTopicsOfNamespace request timeout to broker, req_id: " << requestId);
+        });
     lock.unlock();
+
+    // TODO: return Error instead
+    Promise<Result, NamespaceTopicsPtr> promise;
+    request->getFuture().addListener([promise](const auto& error, const auto& response) {
+        if (error.result == ResultOk) {
+            promise.setValue(response);
+        } else {
+            promise.setFailed(error.result);
+        }
+    });
+
+    if (mockingRequests_.load(std::memory_order_acquire) && mockServer_ != nullptr &&
+        mockServer_->sendRequest("GET_TOPICS_OF_NAMESPACE", requestId)) {
+        return promise.getFuture();
+    }
     sendCommand(Commands::newGetTopicsOfNamespace(nsName, mode, requestId));
     return promise.getFuture();
 }
 
-Future<Result, SchemaInfo> ClientConnection::newGetSchema(const std::string& topicName,
-                                                          const std::string& version, uint64_t requestId) {
+Future<Error, SchemaInfo> ClientConnection::newGetSchema(const std::string& topicName,
+                                                         const std::string& version, uint64_t requestId) {
     Lock lock(mutex_);
 
-    Promise<Result, SchemaInfo> promise;
     if (isClosed()) {
         lock.unlock();
-        LOG_ERROR(cnxString_ << "Client is not connected to the broker");
-        promise.setFailed(ResultNotConnected);
+        LOG_ERROR(cnxString() << "Client is not connected to the broker");
+        Promise<Error, SchemaInfo> promise;
+        promise.setFailed(Error{ResultNotConnected, ""});
         return promise.getFuture();
     }
 
-    auto timer = executor_->createDeadlineTimer();
-    pendingGetSchemaRequests_.emplace(requestId, GetSchemaRequest{promise, timer});
+    auto request =
+        insertRequest(pendingGetSchemaRequests_, requestId, [cnxString = cnxString(), requestId]() {
+            LOG_WARN(cnxString << "GetSchema request timeout to broker, req_id: " << requestId);
+        });
+    auto future = request->getFuture();
     lock.unlock();
 
-    auto weakSelf = weak_from_this();
-    timer->expires_from_now(operationsTimeout_);
-    timer->async_wait([this, weakSelf, requestId](const ASIO_ERROR& ec) {
-        auto self = weakSelf.lock();
-        if (!self) {
-            return;
-        }
-        Lock lock(mutex_);
-        auto it = pendingGetSchemaRequests_.find(requestId);
-        if (it != pendingGetSchemaRequests_.end()) {
-            auto promise = std::move(it->second.promise);
-            pendingGetSchemaRequests_.erase(it);
-            lock.unlock();
-            promise.setFailed(ResultTimeout);
-        }
-    });
-
+    if (mockingRequests_.load(std::memory_order_acquire) && mockServer_ != nullptr &&
+        mockServer_->sendRequest("GET_SCHEMA", requestId)) {
+        return future;
+    }
     sendCommand(Commands::newGetSchema(topicName, version, requestId));
-    return promise.getFuture();
+    return future;
 }
 
 void ClientConnection::checkServerError(ServerError error, const std::string& message) {
@@ -1563,8 +1637,8 @@ void ClientConnection::handleSendReceipt(const proto::CommandSendReceipt& sendRe
     const proto::MessageIdData& messageIdData = sendReceipt.message_id();
     auto messageId = toMessageId(messageIdData);
 
-    LOG_DEBUG(cnxString_ << "Got receipt for producer: " << producerId << " -- msg: " << sequenceId
-                         << "-- message id: " << messageId);
+    LOG_DEBUG(cnxString() << "Got receipt for producer: " << producerId << " -- msg: " << sequenceId
+                          << "-- message id: " << messageId);
 
     Lock lock(mutex_);
     auto it = producers_.find(producerId);
@@ -1576,17 +1650,17 @@ void ClientConnection::handleSendReceipt(const proto::CommandSendReceipt& sendRe
             if (!producer->ackReceived(sequenceId, messageId)) {
                 // If the producer fails to process the ack, we need to close the connection
                 // to give it a chance to recover from there
-                close(ResultDisconnected);
+                close(Error{ResultDisconnected, ""});
             }
         }
     } else {
-        LOG_ERROR(cnxString_ << "Got invalid producer Id in SendReceipt: "  //
-                             << producerId << " -- msg: " << sequenceId);
+        LOG_ERROR(cnxString() << "Got invalid producer Id in SendReceipt: "  //
+                              << producerId << " -- msg: " << sequenceId);
     }
 }
 
 void ClientConnection::handleSendError(const proto::CommandSendError& error) {
-    LOG_WARN(cnxString_ << "Received send error from server: " << error.message());
+    LOG_WARN(cnxString() << "Received send error from server: " << error.message());
     if (ChecksumError == error.error()) {
         long producerId = error.producer_id();
         long sequenceId = error.sequence_id();
@@ -1600,40 +1674,38 @@ void ClientConnection::handleSendError(const proto::CommandSendError& error) {
                 if (!producer->removeCorruptMessage(sequenceId)) {
                     // If the producer fails to remove corrupt msg, we need to close the
                     // connection to give it a chance to recover from there
-                    close(ResultDisconnected);
+                    close(Error{ResultDisconnected, ""});
                 }
             }
         }
     } else {
-        close(ResultDisconnected);
+        close(Error{ResultDisconnected, ""});
     }
 }
 
 void ClientConnection::handleSuccess(const proto::CommandSuccess& success) {
-    LOG_DEBUG(cnxString_ << "Received success response from server. req_id: " << success.request_id());
+    LOG_DEBUG(cnxString() << "Received success response from server. req_id: " << success.request_id());
 
     Lock lock(mutex_);
     auto it = pendingRequests_.find(success.request_id());
     if (it != pendingRequests_.end()) {
-        PendingRequestData requestData = it->second;
+        auto request = std::move(it->second);
         pendingRequests_.erase(it);
         lock.unlock();
 
-        requestData.promise.setValue({});
-        requestData.timer->cancel();
+        request->complete({});
     }
 }
 
 void ClientConnection::handlePartitionedMetadataResponse(
     const proto::CommandPartitionedTopicMetadataResponse& partitionMetadataResponse) {
-    LOG_DEBUG(cnxString_ << "Received partition-metadata response from server. req_id: "
-                         << partitionMetadataResponse.request_id());
+    LOG_DEBUG(cnxString() << "Received partition-metadata response from server. req_id: "
+                          << partitionMetadataResponse.request_id());
 
     Lock lock(mutex_);
     auto it = pendingLookupRequests_.find(partitionMetadataResponse.request_id());
     if (it != pendingLookupRequests_.end()) {
-        it->second.timer->cancel();
-        LookupDataResultPromisePtr lookupDataPromise = it->second.promise;
+        auto request = std::move(it->second);
         pendingLookupRequests_.erase(it);
         numOfPendingLookupRequest_--;
         lock.unlock();
@@ -1642,22 +1714,25 @@ void ClientConnection::handlePartitionedMetadataResponse(
             (partitionMetadataResponse.response() ==
              proto::CommandPartitionedTopicMetadataResponse::Failed)) {
             if (partitionMetadataResponse.has_error()) {
-                LOG_ERROR(cnxString_ << "Failed partition-metadata lookup req_id: "
-                                     << partitionMetadataResponse.request_id()
-                                     << " error: " << partitionMetadataResponse.error()
-                                     << " msg: " << partitionMetadataResponse.message());
-                checkServerError(partitionMetadataResponse.error(), partitionMetadataResponse.message());
-                lookupDataPromise->setFailed(
-                    getResult(partitionMetadataResponse.error(), partitionMetadataResponse.message()));
+                LOG_ERROR(cnxString() << "Failed partition-metadata lookup req_id: "
+                                      << partitionMetadataResponse.request_id()
+                                      << " error: " << partitionMetadataResponse.error()
+                                      << " msg: " << partitionMetadataResponse.message());
+                auto msg = partitionMetadataResponse.message();
+                checkServerError(partitionMetadataResponse.error(), msg);
+                auto result = getResult(partitionMetadataResponse.error(), msg);
+                request->fail(Error{result, std::move(msg)});
             } else {
-                LOG_ERROR(cnxString_ << "Failed partition-metadata lookup req_id: "
-                                     << partitionMetadataResponse.request_id() << " with empty response: ");
-                lookupDataPromise->setFailed(ResultConnectError);
+                LOG_ERROR(cnxString() << "Failed partition-metadata lookup req_id: "
+                                      << partitionMetadataResponse.request_id() << " with empty response: ");
+                request->fail(
+                    Error{ResultConnectError, "Empty response from broker for request " +
+                                                  std::to_string(partitionMetadataResponse.request_id())});
             }
         } else {
             LookupDataResultPtr lookupResultPtr = std::make_shared<LookupDataResult>();
             lookupResultPtr->setPartitions(partitionMetadataResponse.partitions());
-            lookupDataPromise->setValue(lookupResultPtr);
+            request->complete(lookupResultPtr);
         }
 
     } else {
@@ -1667,27 +1742,27 @@ void ClientConnection::handlePartitionedMetadataResponse(
 
 void ClientConnection::handleConsumerStatsResponse(
     const proto::CommandConsumerStatsResponse& consumerStatsResponse) {
-    LOG_DEBUG(cnxString_ << "ConsumerStatsResponse command - Received consumer stats "
-                            "response from server. req_id: "
-                         << consumerStatsResponse.request_id());
+    LOG_DEBUG(cnxString() << "ConsumerStatsResponse command - Received consumer stats "
+                             "response from server. req_id: "
+                          << consumerStatsResponse.request_id());
     Lock lock(mutex_);
     auto it = pendingConsumerStatsMap_.find(consumerStatsResponse.request_id());
     if (it != pendingConsumerStatsMap_.end()) {
-        Promise<Result, BrokerConsumerStatsImpl> consumerStatsPromise = it->second;
+        auto request = std::move(it->second);
         pendingConsumerStatsMap_.erase(it);
         lock.unlock();
 
         if (consumerStatsResponse.has_error_code()) {
             if (consumerStatsResponse.has_error_message()) {
-                LOG_ERROR(cnxString_ << " Failed to get consumer stats - "
-                                     << consumerStatsResponse.error_message());
+                LOG_ERROR(cnxString()
+                          << " Failed to get consumer stats - " << consumerStatsResponse.error_message());
             }
-            consumerStatsPromise.setFailed(
+            request.setFailed(
                 getResult(consumerStatsResponse.error_code(), consumerStatsResponse.error_message()));
         } else {
-            LOG_DEBUG(cnxString_ << "ConsumerStatsResponse command - Received consumer stats "
-                                    "response from server. req_id: "
-                                 << consumerStatsResponse.request_id() << " Stats: ");
+            LOG_DEBUG(cnxString() << "ConsumerStatsResponse command - Received consumer stats "
+                                     "response from server. req_id: "
+                                  << consumerStatsResponse.request_id() << " Stats: ");
             BrokerConsumerStatsImpl brokerStats(
                 consumerStatsResponse.msgrateout(), consumerStatsResponse.msgthroughputout(),
                 consumerStatsResponse.msgrateredeliver(), consumerStatsResponse.consumername(),
@@ -1695,7 +1770,7 @@ void ClientConnection::handleConsumerStatsResponse(
                 consumerStatsResponse.blockedconsumeronunackedmsgs(), consumerStatsResponse.address(),
                 consumerStatsResponse.connectedsince(), consumerStatsResponse.type(),
                 consumerStatsResponse.msgrateexpired(), consumerStatsResponse.msgbacklog());
-            consumerStatsPromise.setValue(brokerStats);
+            request.setValue(brokerStats);
         }
     } else {
         LOG_WARN("ConsumerStatsResponse command - Received unknown request id from server: "
@@ -1705,14 +1780,10 @@ void ClientConnection::handleConsumerStatsResponse(
 
 void ClientConnection::handleLookupTopicRespose(
     const proto::CommandLookupTopicResponse& lookupTopicResponse) {
-    LOG_DEBUG(cnxString_ << "Received lookup response from server. req_id: "
-                         << lookupTopicResponse.request_id());
-
     Lock lock(mutex_);
     auto it = pendingLookupRequests_.find(lookupTopicResponse.request_id());
     if (it != pendingLookupRequests_.end()) {
-        it->second.timer->cancel();
-        LookupDataResultPromisePtr lookupDataPromise = it->second.promise;
+        auto request = std::move(it->second);
         pendingLookupRequests_.erase(it);
         numOfPendingLookupRequest_--;
         lock.unlock();
@@ -1720,25 +1791,28 @@ void ClientConnection::handleLookupTopicRespose(
         if (!lookupTopicResponse.has_response() ||
             (lookupTopicResponse.response() == proto::CommandLookupTopicResponse::Failed)) {
             if (lookupTopicResponse.has_error()) {
-                LOG_ERROR(cnxString_ << "Failed lookup req_id: " << lookupTopicResponse.request_id()
-                                     << " error: " << lookupTopicResponse.error()
-                                     << " msg: " << lookupTopicResponse.message());
-                checkServerError(lookupTopicResponse.error(), lookupTopicResponse.message());
-                lookupDataPromise->setFailed(
-                    getResult(lookupTopicResponse.error(), lookupTopicResponse.message()));
+                LOG_ERROR(cnxString() << "Failed lookup req_id: " << lookupTopicResponse.request_id()
+                                      << " error: " << lookupTopicResponse.error()
+                                      << " msg: " << lookupTopicResponse.message());
+                auto msg = lookupTopicResponse.message();
+                checkServerError(lookupTopicResponse.error(), msg);
+                auto result = getResult(lookupTopicResponse.error(), lookupTopicResponse.message());
+                request->fail(Error{result, std::move(msg)});
             } else {
-                LOG_ERROR(cnxString_ << "Failed lookup req_id: " << lookupTopicResponse.request_id()
-                                     << " with empty response: ");
-                lookupDataPromise->setFailed(ResultConnectError);
+                LOG_ERROR(cnxString() << "Failed lookup req_id: " << lookupTopicResponse.request_id()
+                                      << " with empty response: ");
+                request->fail(
+                    Error{ResultConnectError, "Empty response from broker for request " +
+                                                  std::to_string(lookupTopicResponse.request_id())});
             }
         } else {
-            LOG_DEBUG(cnxString_ << "Received lookup response from server. req_id: "
-                                 << lookupTopicResponse.request_id()  //
-                                 << " -- broker-url: " << lookupTopicResponse.brokerserviceurl()
-                                 << " -- broker-tls-url: "  //
-                                 << lookupTopicResponse.brokerserviceurltls()
-                                 << " authoritative: " << lookupTopicResponse.authoritative()  //
-                                 << " redirect: " << lookupTopicResponse.response());
+            LOG_DEBUG(cnxString() << "Received lookup response from server. req_id: "
+                                  << lookupTopicResponse.request_id()  //
+                                  << " -- broker-url: " << lookupTopicResponse.brokerserviceurl()
+                                  << " -- broker-tls-url: "  //
+                                  << lookupTopicResponse.brokerserviceurltls()
+                                  << " authoritative: " << lookupTopicResponse.authoritative()  //
+                                  << " redirect: " << lookupTopicResponse.response());
             LookupDataResultPtr lookupResultPtr = std::make_shared<LookupDataResult>();
 
             if (tlsSocket_) {
@@ -1752,7 +1826,7 @@ void ClientConnection::handleLookupTopicRespose(
             lookupResultPtr->setRedirect(lookupTopicResponse.response() ==
                                          proto::CommandLookupTopicResponse::Redirect);
             lookupResultPtr->setShouldProxyThroughServiceUrl(lookupTopicResponse.proxy_through_service_url());
-            lookupDataPromise->setValue(lookupResultPtr);
+            request->complete(lookupResultPtr);
         }
 
     } else {
@@ -1761,18 +1835,19 @@ void ClientConnection::handleLookupTopicRespose(
 }
 
 void ClientConnection::handleProducerSuccess(const proto::CommandProducerSuccess& producerSuccess) {
-    LOG_DEBUG(cnxString_ << "Received success producer response from server. req_id: "
-                         << producerSuccess.request_id()  //
-                         << " -- producer name: " << producerSuccess.producer_name());
+    LOG_DEBUG(cnxString() << "Received success producer response from server. req_id: "
+                          << producerSuccess.request_id()  //
+                          << " -- producer name: " << producerSuccess.producer_name());
 
     Lock lock(mutex_);
     auto it = pendingRequests_.find(producerSuccess.request_id());
     if (it != pendingRequests_.end()) {
-        PendingRequestData requestData = it->second;
+        auto request = it->second;
         if (!producerSuccess.producer_ready()) {
-            LOG_INFO(cnxString_ << " Producer " << producerSuccess.producer_name()
-                                << " has been queued up at broker. req_id: " << producerSuccess.request_id());
-            requestData.hasGotResponse->store(true);
+            LOG_INFO(cnxString() << " Producer " << producerSuccess.producer_name()
+                                 << " has been queued up at broker. req_id: "
+                                 << producerSuccess.request_id());
+            request->disableTimeout();
             lock.unlock();
         } else {
             pendingRequests_.erase(it);
@@ -1784,50 +1859,47 @@ void ClientConnection::handleProducerSuccess(const proto::CommandProducerSuccess
                 data.schemaVersion = producerSuccess.schema_version();
             }
             if (producerSuccess.has_topic_epoch()) {
-                data.topicEpoch = boost::make_optional(producerSuccess.topic_epoch());
+                data.topicEpoch = std::make_optional(producerSuccess.topic_epoch());
             } else {
-                data.topicEpoch = boost::none;
+                data.topicEpoch = std::nullopt;
             }
-            requestData.promise.setValue(data);
-            requestData.timer->cancel();
+            request->complete(data);
         }
     }
 }
 
 void ClientConnection::handleError(const proto::CommandError& error) {
     Result result = getResult(error.error(), error.message());
-    LOG_WARN(cnxString_ << "Received error response from server: " << result
-                        << (error.has_message() ? (" (" + error.message() + ")") : "")
-                        << " -- req_id: " << error.request_id());
+    LOG_WARN(cnxString() << "Received error response from server: " << result
+                         << (error.has_message() ? (" (" + error.message() + ")") : "")
+                         << " -- req_id: " << error.request_id());
+    Error requestError{result, error.message()};
 
     Lock lock(mutex_);
 
     auto it = pendingRequests_.find(error.request_id());
     if (it != pendingRequests_.end()) {
-        PendingRequestData requestData = it->second;
+        auto request = std::move(it->second);
         pendingRequests_.erase(it);
         lock.unlock();
 
-        requestData.promise.setFailed(result);
-        requestData.timer->cancel();
+        request->fail(requestError);
     } else {
-        PendingGetLastMessageIdRequestsMap::iterator it =
-            pendingGetLastMessageIdRequests_.find(error.request_id());
+        auto it = pendingGetLastMessageIdRequests_.find(error.request_id());
         if (it != pendingGetLastMessageIdRequests_.end()) {
-            auto getLastMessageIdPromise = it->second.promise;
+            auto request = std::move(it->second);
             pendingGetLastMessageIdRequests_.erase(it);
             lock.unlock();
 
-            getLastMessageIdPromise->setFailed(result);
+            request->fail(requestError);
         } else {
-            PendingGetNamespaceTopicsMap::iterator it =
-                pendingGetNamespaceTopicsRequests_.find(error.request_id());
+            auto it = pendingGetNamespaceTopicsRequests_.find(error.request_id());
             if (it != pendingGetNamespaceTopicsRequests_.end()) {
-                Promise<Result, NamespaceTopicsPtr> getNamespaceTopicsPromise = it->second;
+                auto request = std::move(it->second);
                 pendingGetNamespaceTopicsRequests_.erase(it);
                 lock.unlock();
 
-                getNamespaceTopicsPromise.setFailed(result);
+                request->fail(requestError);
             } else {
                 lock.unlock();
             }
@@ -1887,7 +1959,7 @@ void ClientConnection::handleTopicMigrated(const proto::CommandTopicMigrated& co
     }
 }
 
-boost::optional<std::string> ClientConnection::getAssignedBrokerServiceUrl(
+optional<std::string> ClientConnection::getAssignedBrokerServiceUrl(
     const proto::CommandCloseProducer& closeProducer) {
     if (tlsSocket_) {
         if (closeProducer.has_assignedbrokerserviceurltls()) {
@@ -1896,10 +1968,10 @@ boost::optional<std::string> ClientConnection::getAssignedBrokerServiceUrl(
     } else if (closeProducer.has_assignedbrokerserviceurl()) {
         return closeProducer.assignedbrokerserviceurl();
     }
-    return boost::none;
+    return {};
 }
 
-boost::optional<std::string> ClientConnection::getAssignedBrokerServiceUrl(
+optional<std::string> ClientConnection::getAssignedBrokerServiceUrl(
     const proto::CommandCloseConsumer& closeConsumer) {
     if (tlsSocket_) {
         if (closeConsumer.has_assignedbrokerserviceurltls()) {
@@ -1908,7 +1980,7 @@ boost::optional<std::string> ClientConnection::getAssignedBrokerServiceUrl(
     } else if (closeConsumer.has_assignedbrokerserviceurl()) {
         return closeConsumer.assignedbrokerserviceurl();
     }
-    return boost::none;
+    return {};
 }
 
 void ClientConnection::handleCloseProducer(const proto::CommandCloseProducer& closeProducer) {
@@ -1928,7 +2000,7 @@ void ClientConnection::handleCloseProducer(const proto::CommandCloseProducer& cl
             producer->disconnectProducer(assignedBrokerServiceUrl);
         }
     } else {
-        LOG_ERROR(cnxString_ << "Got invalid producer Id in closeProducer command: " << producerId);
+        LOG_ERROR(cnxString() << "Got invalid producer Id in closeProducer command: " << producerId);
     }
 }
 
@@ -1949,18 +2021,19 @@ void ClientConnection::handleCloseConsumer(const proto::CommandCloseConsumer& cl
             consumer->disconnectConsumer(assignedBrokerServiceUrl);
         }
     } else {
-        LOG_ERROR(cnxString_ << "Got invalid consumer Id in closeConsumer command: " << consumerId);
+        LOG_ERROR(cnxString() << "Got invalid consumer Id in closeConsumer command: " << consumerId);
     }
 }
 
 void ClientConnection::handleAuthChallenge() {
-    LOG_DEBUG(cnxString_ << "Received auth challenge from broker");
+    LOG_DEBUG(cnxString() << "Received auth challenge from broker");
 
     Result result;
+    // TODO: use Error instead
     SharedBuffer buffer = Commands::newAuthResponse(authentication_, result);
     if (result != ResultOk) {
-        LOG_ERROR(cnxString_ << "Failed to send auth response: " << result);
-        close(result);
+        LOG_ERROR(cnxString() << "Failed to send auth response: " << result);
+        close(Error{result, "Failed to auth response"});
         return;
     }
     auto self = shared_from_this();
@@ -1972,23 +2045,22 @@ void ClientConnection::handleAuthChallenge() {
 
 void ClientConnection::handleGetLastMessageIdResponse(
     const proto::CommandGetLastMessageIdResponse& getLastMessageIdResponse) {
-    LOG_DEBUG(cnxString_ << "Received getLastMessageIdResponse from server. req_id: "
-                         << getLastMessageIdResponse.request_id());
+    LOG_DEBUG(cnxString() << "Received getLastMessageIdResponse from server. req_id: "
+                          << getLastMessageIdResponse.request_id());
 
     Lock lock(mutex_);
     auto it = pendingGetLastMessageIdRequests_.find(getLastMessageIdResponse.request_id());
 
     if (it != pendingGetLastMessageIdRequests_.end()) {
-        auto getLastMessageIdPromise = it->second.promise;
+        auto request = std::move(it->second);
         pendingGetLastMessageIdRequests_.erase(it);
         lock.unlock();
 
         if (getLastMessageIdResponse.has_consumer_mark_delete_position()) {
-            getLastMessageIdPromise->setValue(
-                {toMessageId(getLastMessageIdResponse.last_message_id()),
-                 toMessageId(getLastMessageIdResponse.consumer_mark_delete_position())});
+            request->complete({toMessageId(getLastMessageIdResponse.last_message_id()),
+                               toMessageId(getLastMessageIdResponse.consumer_mark_delete_position())});
         } else {
-            getLastMessageIdPromise->setValue({toMessageId(getLastMessageIdResponse.last_message_id())});
+            request->complete({toMessageId(getLastMessageIdResponse.last_message_id())});
         }
     } else {
         lock.unlock();
@@ -1999,14 +2071,14 @@ void ClientConnection::handleGetLastMessageIdResponse(
 
 void ClientConnection::handleGetTopicOfNamespaceResponse(
     const proto::CommandGetTopicsOfNamespaceResponse& response) {
-    LOG_DEBUG(cnxString_ << "Received GetTopicsOfNamespaceResponse from server. req_id: "
-                         << response.request_id() << " topicsSize" << response.topics_size());
+    LOG_DEBUG(cnxString() << "Received GetTopicsOfNamespaceResponse from server. req_id: "
+                          << response.request_id() << " topicsSize" << response.topics_size());
 
     Lock lock(mutex_);
     auto it = pendingGetNamespaceTopicsRequests_.find(response.request_id());
 
     if (it != pendingGetNamespaceTopicsRequests_.end()) {
-        Promise<Result, NamespaceTopicsPtr> getTopicsPromise = it->second;
+        auto request = std::move(it->second);
         pendingGetNamespaceTopicsRequests_.erase(it);
         lock.unlock();
 
@@ -2028,7 +2100,7 @@ void ClientConnection::handleGetTopicOfNamespaceResponse(
         NamespaceTopicsPtr topicsPtr =
             std::make_shared<std::vector<std::string>>(topicSet.begin(), topicSet.end());
 
-        getTopicsPromise.setValue(topicsPtr);
+        request->complete(topicsPtr);
     } else {
         lock.unlock();
         LOG_WARN(
@@ -2039,23 +2111,24 @@ void ClientConnection::handleGetTopicOfNamespaceResponse(
 }
 
 void ClientConnection::handleGetSchemaResponse(const proto::CommandGetSchemaResponse& response) {
-    LOG_DEBUG(cnxString_ << "Received GetSchemaResponse from server. req_id: " << response.request_id());
+    LOG_DEBUG(cnxString() << "Received GetSchemaResponse from server. req_id: " << response.request_id());
     Lock lock(mutex_);
     auto it = pendingGetSchemaRequests_.find(response.request_id());
     if (it != pendingGetSchemaRequests_.end()) {
-        Promise<Result, SchemaInfo> getSchemaPromise = it->second.promise;
+        auto request = std::move(it->second);
         pendingGetSchemaRequests_.erase(it);
         lock.unlock();
 
         if (response.has_error_code()) {
             Result result = getResult(response.error_code(), response.error_message());
             if (response.error_code() != proto::TopicNotFound) {
-                LOG_WARN(cnxString_ << "Received error GetSchemaResponse from server " << result
-                                    << (response.has_error_message() ? (" (" + response.error_message() + ")")
-                                                                     : "")
-                                    << " -- req_id: " << response.request_id());
+                LOG_WARN(cnxString() << "Received error GetSchemaResponse from server " << result
+                                     << (response.has_error_message()
+                                             ? (" (" + response.error_message() + ")")
+                                             : "")
+                                     << " -- req_id: " << response.request_id());
             }
-            getSchemaPromise.setFailed(result);
+            request->fail(Error{result, response.error_message()});
             return;
         }
 
@@ -2066,7 +2139,7 @@ void ClientConnection::handleGetSchemaResponse(const proto::CommandGetSchemaResp
             properties[kv->key()] = kv->value();
         }
         SchemaInfo schemaInfo(static_cast<SchemaType>(schema.type()), "", schema.schema_data(), properties);
-        getSchemaPromise.setValue(schemaInfo);
+        request->complete(schemaInfo);
     } else {
         lock.unlock();
         LOG_WARN(
@@ -2077,7 +2150,7 @@ void ClientConnection::handleGetSchemaResponse(const proto::CommandGetSchemaResp
 }
 
 void ClientConnection::handleAckResponse(const proto::CommandAckResponse& response) {
-    LOG_DEBUG(cnxString_ << "Received AckResponse from server. req_id: " << response.request_id());
+    LOG_DEBUG(cnxString() << "Received AckResponse from server. req_id: " << response.request_id());
 
     Lock lock(mutex_);
     auto it = pendingRequests_.find(response.request_id());
@@ -2087,24 +2160,23 @@ void ClientConnection::handleAckResponse(const proto::CommandAckResponse& respon
         return;
     }
 
-    auto promise = it->second.promise;
+    auto request = std::move(it->second);
     pendingRequests_.erase(it);
     lock.unlock();
 
     if (response.has_error()) {
-        promise.setFailed(getResult(response.error(), ""));
+        request->fail(Error{getResult(response.error(), ""), response.message()});
     } else {
-        promise.setValue({});
+        request->complete({});
     }
 }
 
 void ClientConnection::unsafeRemovePendingRequest(long requestId) {
     auto it = pendingRequests_.find(requestId);
     if (it != pendingRequests_.end()) {
-        it->second.promise.setFailed(ResultDisconnected);
-        ASIO_ERROR ec;
-        it->second.timer->cancel(ec);
+        auto request = std::move(it->second);
         pendingRequests_.erase(it);
+        request->fail(Error{ResultDisconnected, ""});
     }
 }
 

@@ -39,6 +39,7 @@ inline bool isResultRetryable(Result result) {
                                                       ResultInvalidConfiguration,
                                                       ResultIncompatibleSchema,
                                                       ResultTopicNotFound,
+                                                      ResultTopicTerminated,
                                                       ResultOperationNotSupported,
                                                       ResultNotAllowedError,
                                                       ResultChecksumError,
@@ -49,7 +50,8 @@ inline bool isResultRetryable(Result result) {
                                                       ResultLookupError,
                                                       ResultTooManyLookupRequestException,
                                                       ResultProducerBlockedQuotaExceededException,
-                                                      ResultProducerBlockedQuotaExceededError};
+                                                      ResultProducerBlockedQuotaExceededError,
+                                                      ResultAlreadyClosed};
     return fatalResults.find(static_cast<int>(result)) == fatalResults.cend();
 }
 

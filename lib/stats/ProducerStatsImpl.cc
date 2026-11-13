@@ -45,9 +45,9 @@ std::string ProducerStatsImpl::latencyToString(const LatencyAccumulator& obj) {
     return os.str();
 }
 
-ProducerStatsImpl::ProducerStatsImpl(std::string producerStr, ExecutorServicePtr executor,
+ProducerStatsImpl::ProducerStatsImpl(std::string producerStr, const ExecutorServicePtr& executor,
                                      unsigned int statsIntervalInSeconds)
-    : producerStr_(producerStr),
+    : producerStr_(std::move(producerStr)),
       latencyAccumulator_(boost::accumulators::tag::extended_p_square::probabilities = probs),
       totalLatencyAccumulator_(boost::accumulators::tag::extended_p_square::probabilities = probs),
       timer_(executor->createDeadlineTimer()),
@@ -106,11 +106,11 @@ void ProducerStatsImpl::messageReceived(Result res, const ptime& publishTime) {
     totalSendMap_[res] += 1;  // Value will automatically be initialized to 0 in the constructor
 }
 
-ProducerStatsImpl::~ProducerStatsImpl() { timer_->cancel(); }
+ProducerStatsImpl::~ProducerStatsImpl() { cancelTimer(*timer_); }
 
 void ProducerStatsImpl::scheduleTimer() {
-    timer_->expires_from_now(std::chrono::seconds(statsIntervalInSeconds_));
-    std::weak_ptr<ProducerStatsImpl> weakSelf{shared_from_this()};
+    timer_->expires_after(std::chrono::seconds(statsIntervalInSeconds_));
+    auto weakSelf = weak_from_this();
     timer_->async_wait([this, weakSelf](const ASIO_ERROR& ec) {
         auto self = weakSelf.lock();
         if (!self) {
