@@ -21,15 +21,10 @@
 #include <assert.h>
 #include <curl/curl.h>
 
+#include <mutex>
 #include <string>
 
 namespace pulsar {
-
-struct CurlInitializer {
-    CurlInitializer() { curl_global_init(CURL_GLOBAL_ALL); }
-    ~CurlInitializer() { curl_global_cleanup(); }
-};
-static CurlInitializer curlInitializer;
 
 class CurlWrapper {
    public:
@@ -47,6 +42,8 @@ class CurlWrapper {
 
     // It must be called before calling other methods
     bool init() {
+        static std::once_flag initFlag;
+        std::call_once(initFlag, [] { curl_global_init(CURL_GLOBAL_ALL); });
         handle_ = curl_easy_init();
         return handle_ != nullptr;
     }
@@ -57,6 +54,7 @@ class CurlWrapper {
         std::string userAgent;
         int timeoutInSeconds{0};
         int maxLookupRedirects{-1};
+        bool authAllowRedirect{false};
     };
 
     struct TlsContext {
@@ -131,6 +129,9 @@ inline CurlWrapper::Result CurlWrapper::get(const std::string& url, const std::s
     // Redirects
     curl_easy_setopt(handle_, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(handle_, CURLOPT_MAXREDIRS, options.maxLookupRedirects);
+    if (options.authAllowRedirect) {
+        curl_easy_setopt(handle_, CURLOPT_UNRESTRICTED_AUTH, 1L);
+    }
 
     char errorBuffer[CURL_ERROR_SIZE] = "";
     curl_easy_setopt(handle_, CURLOPT_ERRORBUFFER, errorBuffer);

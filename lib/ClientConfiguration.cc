@@ -57,8 +57,6 @@ ClientConfiguration& ClientConfiguration::setAuth(const AuthenticationPtr& authe
     return *this;
 }
 
-Authentication& ClientConfiguration::getAuth() const { return *impl_->authenticationPtr; }
-
 const AuthenticationPtr& ClientConfiguration::getAuthPtr() const { return impl_->authenticationPtr; }
 
 ClientConfiguration& ClientConfiguration::setOperationTimeoutSeconds(int timeout) {
@@ -68,6 +66,16 @@ ClientConfiguration& ClientConfiguration::setOperationTimeoutSeconds(int timeout
 
 int ClientConfiguration::getOperationTimeoutSeconds() const {
     return std::chrono::duration_cast<std::chrono::seconds>(impl_->operationTimeout).count();
+}
+
+ClientConfiguration& ClientConfiguration::setOperationTimeoutMs(int timeoutMs) {
+    impl_->operationTimeout = std::chrono::milliseconds(timeoutMs);
+    return *this;
+}
+
+int ClientConfiguration::getOperationTimeoutMs() const {
+    return static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(impl_->operationTimeout).count());
 }
 
 ClientConfiguration& ClientConfiguration::setIOThreads(int threads) {
@@ -83,13 +91,6 @@ ClientConfiguration& ClientConfiguration::setMessageListenerThreads(int threads)
 }
 
 int ClientConfiguration::getMessageListenerThreads() const { return impl_->messageListenerThreads; }
-
-ClientConfiguration& ClientConfiguration::setUseTls(bool useTls) {
-    impl_->useTls = useTls;
-    return *this;
-}
-
-bool ClientConfiguration::isUseTls() const { return impl_->useTls; }
 
 ClientConfiguration& ClientConfiguration::setValidateHostName(bool validateHostName) {
     impl_->validateHostName = validateHostName;
@@ -119,10 +120,6 @@ const std::string& ClientConfiguration::getTlsCertificateFilePath() const {
 ClientConfiguration& ClientConfiguration::setTlsTrustCertsFilePath(const std::string& filePath) {
     impl_->tlsTrustCertsFilePath = filePath;
     return *this;
-}
-
-const std::string& ClientConfiguration::getTlsTrustCertsFilePath() const {
-    return impl_->tlsTrustCertsFilePath;
 }
 
 ClientConfiguration& ClientConfiguration::setTlsAllowInsecureConnection(bool allowInsecure) {
@@ -223,6 +220,16 @@ ClientConfiguration& ClientConfiguration::setConnectionTimeout(int timeoutMs) {
 
 int ClientConfiguration::getConnectionTimeout() const { return impl_->connectionTimeoutMs; }
 
+ClientConfiguration& ClientConfiguration::setKeepAliveIntervalInSeconds(
+    unsigned int keepAliveIntervalInSeconds) {
+    impl_->keepAliveIntervalInSeconds = keepAliveIntervalInSeconds;
+    return *this;
+}
+
+unsigned int ClientConfiguration::getKeepAliveIntervalInSeconds() const {
+    return impl_->keepAliveIntervalInSeconds;
+}
+
 ClientConfiguration& ClientConfiguration::setDescription(const std::string& description) {
     if (description.length() > 64) {
         throw std::invalid_argument("The description length exceeds 64");
@@ -232,5 +239,12 @@ ClientConfiguration& ClientConfiguration::setDescription(const std::string& desc
 }
 
 const std::string& ClientConfiguration::getDescription() const noexcept { return impl_->description; }
+
+ClientConfiguration& ClientConfiguration::setHttpLookupAuthAllowRedirect(bool allow) {
+    impl_->httpLookupAuthAllowRedirect = allow;
+    return *this;
+}
+
+bool ClientConfiguration::isHttpLookupAuthAllowRedirect() const { return impl_->httpLookupAuthAllowRedirect; }
 
 }  // namespace pulsar

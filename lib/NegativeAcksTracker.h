@@ -27,6 +27,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "AsioDefines.h"
 #include "AsioTimer.h"
@@ -39,10 +41,12 @@ class ClientImpl;
 using ClientImplPtr = std::shared_ptr<ClientImpl>;
 class ExecutorService;
 using ExecutorServicePtr = std::shared_ptr<ExecutorService>;
+using LedgerId = int64_t;
 
 class NegativeAcksTracker : public std::enable_shared_from_this<NegativeAcksTracker> {
    public:
-    NegativeAcksTracker(ClientImplPtr client, ConsumerImpl &consumer, const ConsumerConfiguration &conf);
+    NegativeAcksTracker(const ClientImplPtr &client, ConsumerImpl &consumer,
+                        const ConsumerConfiguration &conf);
 
     NegativeAcksTracker(const NegativeAcksTracker &) = delete;
 
@@ -63,8 +67,9 @@ class NegativeAcksTracker : public std::enable_shared_from_this<NegativeAcksTrac
 
     std::chrono::milliseconds nackDelay_;
     std::chrono::milliseconds timerInterval_;
+    int nackPrecisionBit_;
     typedef typename std::chrono::steady_clock Clock;
-    std::map<MessageId, Clock::time_point> nackedMessages_;
+    std::map<Clock::time_point, std::unordered_map<LedgerId, std::unordered_set<int64_t>>> nackedMessages_;
 
     const DeadlineTimerPtr timer_;
     std::atomic_bool closed_{false};

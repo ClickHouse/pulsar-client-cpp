@@ -19,9 +19,12 @@
 #include "ConsumerImpl.h"
 
 #include <pulsar/DeadLetterPolicyBuilder.h>
+#include <pulsar/EncryptionContext.h>
 #include <pulsar/MessageIdBuilder.h>
 
 #include <algorithm>
+#include <utility>
+#include <variant>
 
 #include "AckGroupingTracker.h"
 #include "AckGroupingTrackerDisabled.h"
@@ -59,14 +62,44 @@ DECLARE_LOG_OBJECT()
 using std::chrono::milliseconds;
 using std::chrono::seconds;
 
-ConsumerImpl::ConsumerImpl(const ClientImplPtr client, const std::string& topic,
+static optional<MessageId> getStartMessageId(const optional<MessageId>& startMessageId, bool inclusive) {
+    if (!inclusive || !startMessageId) {
+        return startMessageId;
+    }
+    // The default ledger id and entry id of a chunked message refer the fields of the last chunk. When the
+    // start message id is inclusive, we need to start from the first chunk.
+    auto chunkMsgIdImpl =
+        dynamic_cast<const ChunkMessageIdImpl*>(Commands::getMessageIdImpl(startMessageId.value()).get());
+    if (chunkMsgIdImpl) {
+        return optional<MessageId>{chunkMsgIdImpl->getChunkedMessageIds().front()};
+    }
+    return startMessageId;
+}
+
+static std::shared_ptr<AckGroupingTracker> newAckGroupingTracker(const std::string& topic,
+                                                                 const ConsumerConfiguration& config,
+                                                                 const ClientImplPtr& client) {
+    if (TopicName::get(topic)->isPersistent()) {
+        if (config.getAckGroupingTimeMs() > 0) {
+            return std::make_shared<AckGroupingTrackerEnabled>(
+                config.getAckGroupingTimeMs(), config.getAckGroupingMaxSize(), config.isAckReceiptEnabled(),
+                client->getIOExecutorProvider()->get());
+        } else {
+            return std::make_shared<AckGroupingTrackerDisabled>();
+        }
+    } else {
+        return std::make_shared<AckGroupingTracker>();
+    }
+}
+
+ConsumerImpl::ConsumerImpl(const ClientImplPtr& client, const std::string& topic,
                            const std::string& subscriptionName, const ConsumerConfiguration& conf,
                            bool isPersistent, const ConsumerInterceptorsPtr& interceptors,
-                           const ExecutorServicePtr listenerExecutor /* = NULL by default */,
+                           const ExecutorServicePtr& listenerExecutor /* = NULL by default */,
                            bool hasParent /* = false by default */,
                            const ConsumerTopicType consumerTopicType /* = NonPartitioned by default */,
                            Commands::SubscriptionMode subscriptionMode,
-                           boost::optional<MessageId> startMessageId)
+                           const optional<MessageId>& startMessageId)
     : ConsumerImplBase(
           client, topic,
           Backoff(milliseconds(client->getClientConfig().getInitialBackoffIntervalMs()),
@@ -90,12 +123,15 @@ ConsumerImpl::ConsumerImpl(const ClientImplPtr client, const std::string& topic,
       consumerStr_("[" + topic + ", " + subscriptionName + ", " + std::to_string(consumerId_) + "] "),
       messageListenerRunning_(!conf.isStartPaused()),
       negativeAcksTracker_(std::make_shared<NegativeAcksTracker>(client, *this, conf)),
+      ackGroupingTrackerPtr_(newAckGroupingTracker(topic, conf, client)),
       readCompacted_(conf.isReadCompacted()),
-      startMessageId_(startMessageId),
+      startMessageIdFromConfig_(pulsar::getStartMessageId(startMessageId, conf.isStartMessageIdInclusive())),
+      startMessageId_(startMessageIdFromConfig_),
       maxPendingChunkedMessage_(conf.getMaxPendingChunkedMessage()),
       autoAckOldestChunkedMessageOnQueueFull_(conf.isAutoAckOldestChunkedMessageOnQueueFull()),
       expireTimeOfIncompleteChunkedMessageMs_(conf.getExpireTimeOfIncompleteChunkedMessageMs()),
-      interceptors_(interceptors) {
+      interceptors_(interceptors),
+      requestIdGenerator_(client->getRequestIdGenerator()) {
     // Initialize un-ACKed messages OT tracker.
     if (conf.getUnAckedMessagesTimeoutMs() != 0) {
         if (conf.getTickDurationInMs() > 0) {
@@ -114,7 +150,8 @@ ConsumerImpl::ConsumerImpl(const ClientImplPtr client, const std::string& topic,
     unsigned int statsIntervalInSeconds = client->getClientConfig().getStatsIntervalInSeconds();
     if (statsIntervalInSeconds) {
         consumerStatsBasePtr_ = std::make_shared<ConsumerStatsImpl>(
-            consumerStr_, client->getIOExecutorProvider()->get(), statsIntervalInSeconds);
+            consumerStr_, client->getIOExecutorProvider()->get()->createDeadlineTimer(),
+            statsIntervalInSeconds);
     } else {
         consumerStatsBasePtr_ = std::make_shared<ConsumerStatsDisabled>();
     }
@@ -126,7 +163,7 @@ ConsumerImpl::ConsumerImpl(const ClientImplPtr client, const std::string& topic,
     }
 
     // Config dlq
-    auto deadLetterPolicy = conf.getDeadLetterPolicy();
+    const auto& deadLetterPolicy = conf.getDeadLetterPolicy();
     if (deadLetterPolicy.getMaxRedeliverCount() > 0) {
         auto deadLetterPolicyBuilder =
             DeadLetterPolicyBuilder()
@@ -144,33 +181,30 @@ ConsumerImpl::ConsumerImpl(const ClientImplPtr client, const std::string& topic,
 }
 
 ConsumerImpl::~ConsumerImpl() {
-    LOG_DEBUG(getName() << "~ConsumerImpl");
+    auto client = client_.lock();
     if (state_ == Ready) {
         // this could happen at least in this condition:
         //      consumer seek, caused reconnection, if consumer close happened before connection ready,
         //      then consumer will not send closeConsumer to Broker side, and caused a leak of consumer in
         //      broker.
-        LOG_WARN(getName() << "Destroyed consumer which was not properly closed");
+        if (client) {
+            LOG_WARN(consumerStr_ << "Destroyed consumer which was not properly closed");
+        }
 
         ClientConnectionPtr cnx = getCnx().lock();
-        ClientImplPtr client = client_.lock();
-        if (client && cnx) {
-            int requestId = client->newRequestId();
-            cnx->sendRequestWithId(Commands::newCloseConsumer(consumerId_, requestId), requestId);
+        if (cnx) {
+            auto requestId = newRequestId();
+            cnx->sendRequestWithId(Commands::newCloseConsumer(consumerId_, requestId), requestId,
+                                   "CLOSE_CONSUMER");
             cnx->removeConsumer(consumerId_);
-            LOG_INFO(getName() << "Closed consumer for race condition: " << consumerId_);
-        } else {
-            LOG_WARN(getName() << "Client is destroyed and cannot send the CloseConsumer command");
         }
     }
-    shutdown();
+    internalShutdown();
 }
 
 void ConsumerImpl::setPartitionIndex(int partitionIndex) { partitionIndex_ = partitionIndex; }
 
 int ConsumerImpl::getPartitionIndex() { return partitionIndex_; }
-
-uint64_t ConsumerImpl::getConsumerId() { return consumerId_; }
 
 Future<Result, ConsumerImplBaseWeakPtr> ConsumerImpl::getConsumerCreatedFuture() {
     return consumerCreatedPromise_.getFuture();
@@ -182,38 +216,7 @@ const std::string& ConsumerImpl::getTopic() const { return topic(); }
 
 void ConsumerImpl::start() {
     HandlerBase::start();
-
-    std::weak_ptr<ConsumerImpl> weakSelf{get_shared_this_ptr()};
-    auto connectionSupplier = [weakSelf]() -> ClientConnectionPtr {
-        auto self = weakSelf.lock();
-        if (!self) {
-            return nullptr;
-        }
-        return self->getCnx().lock();
-    };
-
-    // NOTE: start() is always called in `ClientImpl`'s method, so lock() returns not null
-    const auto requestIdGenerator = client_.lock()->getRequestIdGenerator();
-    const auto requestIdSupplier = [requestIdGenerator] { return (*requestIdGenerator)++; };
-
-    // Initialize ackGroupingTrackerPtr_ here because the get_shared_this_ptr() was not initialized until the
-    // constructor completed.
-    if (TopicName::get(topic())->isPersistent()) {
-        if (config_.getAckGroupingTimeMs() > 0) {
-            ackGroupingTrackerPtr_.reset(new AckGroupingTrackerEnabled(
-                connectionSupplier, requestIdSupplier, consumerId_, config_.isAckReceiptEnabled(),
-                config_.getAckGroupingTimeMs(), config_.getAckGroupingMaxSize(),
-                client_.lock()->getIOExecutorProvider()->get()));
-        } else {
-            ackGroupingTrackerPtr_.reset(new AckGroupingTrackerDisabled(
-                connectionSupplier, requestIdSupplier, consumerId_, config_.isAckReceiptEnabled()));
-        }
-    } else {
-        LOG_INFO(getName() << "ACK will NOT be sent to broker for this non-persistent topic.");
-        ackGroupingTrackerPtr_.reset(new AckGroupingTracker(connectionSupplier, requestIdSupplier,
-                                                            consumerId_, config_.isAckReceiptEnabled()));
-    }
-    ackGroupingTrackerPtr_->start();
+    ackGroupingTrackerPtr_->start(get_shared_this_ptr());
 }
 
 void ConsumerImpl::beforeConnectionChange(ClientConnection& cnx) { cnx.removeConsumer(consumerId_); }
@@ -222,34 +225,32 @@ void ConsumerImpl::onNegativeAcksSend(const std::set<MessageId>& messageIds) {
     interceptors_->onNegativeAcksSend(Consumer(shared_from_this()), messageIds);
 }
 
-Future<Result, bool> ConsumerImpl::connectionOpened(const ClientConnectionPtr& cnx) {
-    // Do not use bool, only Result.
-    Promise<Result, bool> promise;
+Future<Error, bool> ConsumerImpl::connectionOpened(const ClientConnectionPtr& cnx) {
+    Promise<Error, bool> promise;
 
     if (state_ == Closed) {
         LOG_DEBUG(getName() << "connectionOpened : Consumer is already closed");
-        promise.setFailed(ResultAlreadyClosed);
+        promise.setFailed(Error{ResultAlreadyClosed, ""});
         return promise.getFuture();
     }
 
-    // Register consumer so that we can handle other incomming commands (e.g. ACTIVE_CONSUMER_CHANGE) after
-    // sending the subscribe request.
-    cnx->registerConsumer(consumerId_, get_shared_this_ptr());
+    optional<MessageId> subscribeMessageId;
+    {
+        LockGuard lock{mutex_};
+        setCnx(cnx);
+        cnx->registerConsumer(consumerId_, get_shared_this_ptr());
+        LOG_DEBUG(cnx->cnxString() << "Registered consumer " << consumerId_);
 
-    if (duringSeek()) {
-        ackGroupingTrackerPtr_->flushAndClean();
+        clearReceiveQueue();
+        subscribeMessageId =
+            (subscriptionMode_ == Commands::SubscriptionModeNonDurable) ? startMessageId_ : std::nullopt;
+        lastDequedMessageId_ = MessageId::earliest();
     }
-
-    Lock lockForMessageId(mutexForMessageId_);
-    clearReceiveQueue();
-    const auto subscribeMessageId =
-        (subscriptionMode_ == Commands::SubscriptionModeNonDurable) ? startMessageId_.get() : boost::none;
-    lockForMessageId.unlock();
 
     unAckedMessageTrackerPtr_->clear();
 
     ClientImplPtr client = client_.lock();
-    long requestId = client->newRequestId();
+    auto requestId = newRequestId();
     SharedBuffer cmd = Commands::newSubscribe(
         topic(), subscription_, consumerId_, requestId, getSubType(), getConsumerName(), subscriptionMode_,
         subscribeMessageId, readCompacted_, config_.getProperties(), config_.getSubscriptionProperties(),
@@ -259,13 +260,22 @@ Future<Result, bool> ConsumerImpl::connectionOpened(const ClientConnectionPtr& c
     // Keep a reference to ensure object is kept alive.
     auto self = get_shared_this_ptr();
     setFirstRequestIdAfterConnect(requestId);
-    cnx->sendRequestWithId(cmd, requestId)
-        .addListener([this, self, cnx, promise](Result result, const ResponseData& responseData) {
-            Result handleResult = handleCreateConsumer(cnx, result);
-            if (handleResult == ResultOk) {
-                promise.setSuccess();
-            } else {
-                promise.setFailed(handleResult);
+    cnx->sendRequestWithId(cmd, requestId, "SUBSCRIBE")
+        .addListener([this, self, cnx, promise](const Error& error, const ResponseData& responseData) {
+            Result handleResult = handleCreateConsumer(cnx, error.result);
+            if (handleResult != ResultOk) {
+                promise.setFailed(Error{handleResult, ""});
+                return;
+            }
+            promise.setSuccess();
+            // Complete the seek callback after completing `promise`, otherwise `reconnectionPending_` will
+            // still be true when the seek operation is done.
+            LockGuard lock{mutex_};
+            if (seekStatus_ == SeekStatus::COMPLETED) {
+                executor_->postWork([seekCallback{std::exchange(seekCallback_, std::nullopt).value()}]() {
+                    seekCallback(ResultOk);
+                });
+                seekStatus_ = SeekStatus::NOT_STARTED;
             }
         });
 
@@ -292,33 +302,66 @@ void ConsumerImpl::sendFlowPermitsToBroker(const ClientConnectionPtr& cnx, int n
 Result ConsumerImpl::handleCreateConsumer(const ClientConnectionPtr& cnx, Result result) {
     Result handleResult = ResultOk;
 
-    static bool firstTime = true;
     if (result == ResultOk) {
-        if (firstTime) {
-            firstTime = false;
-        }
-        LOG_INFO(getName() << "Created consumer on broker " << cnx->cnxString());
         {
-            Lock lock(mutex_);
-            setCnx(cnx);
+            Lock mutexLock(mutex_);
+            if (!changeToReadyState()) {
+                auto client = client_.lock();
+                if (client) {
+                    LOG_INFO(getName() << "Closing subscribed consumer since it was already closed");
+                    int requestId = client->newRequestId();
+                    auto name = getName();
+                    cnx->sendRequestWithId(Commands::newCloseConsumer(consumerId_, requestId), requestId,
+                                           "CLOSE_CONSUMER")
+                        .addListener([name](const Error& error, const ResponseData&) {
+                            if (error.result == ResultOk) {
+                                LOG_INFO(name << "Closed consumer successfully after subscribe completed");
+                            } else {
+                                LOG_WARN(name << "Failed to close consumer: " << strResult(error.result));
+                            }
+                        });
+                } else {
+                    // This should not happen normally because if client is destroyed, the connection pool
+                    // should also be closed, which means all connections should be closed. Close the
+                    // connection to let broker know this registered consumer is inactive.
+                    LOG_WARN(getName()
+                             << "Client already closed when subscribe completed, close the connection "
+                             << cnx->cnxString());
+                    cnx->close(Error{ResultNotConnected, ""});
+                }
+                return ResultAlreadyClosed;
+            }
+
+            mutexLock.unlock();
+            LOG_INFO(getName() << "Created consumer on broker " << cnx->cnxString());
             incomingMessages_.clear();
             possibleSendToDeadLetterTopicMessages_.clear();
-            state_ = Ready;
             backoff_.reset();
-            // Complicated logic since we don't have a isLocked() function for mutex
-            if (waitingForZeroQueueSizeMessage) {
-                sendFlowPermitsToBroker(cnx, 1);
+            // Re-derive end-of-topic from the new session: termination stops new publications, not
+            // redelivery of unacked messages, so a stale flag would report ResultTopicTerminated in
+            // the window before redeliveries arrive. The broker re-sends CommandReachedEndOfTopic
+            // once this consumer's read position reaches the terminate marker again.
+            hasReachedEndOfTopic_ = false;
+            if (!messageListener_ && config_.getReceiverQueueSize() == 0) {
+                // Complicated logic since we don't have a isLocked() function for mutex
+                if (waitingForZeroQueueSizeMessage) {
+                    sendFlowPermitsToBroker(cnx, 1);
+                }
+                // Note that the order of lock acquisition must be mutex_ -> pendingReceiveMutex_,
+                // otherwise a deadlock will occur.
+                Lock pendingReceiveMutexLock(pendingReceiveMutex_);
+                if (!pendingReceives_.empty()) {
+                    sendFlowPermitsToBroker(cnx, pendingReceives_.size());
+                }
             }
             availablePermits_ = 0;
         }
 
         LOG_DEBUG(getName() << "Send initial flow permits: " << config_.getReceiverQueueSize());
-        if (consumerTopicType_ == NonPartitioned || !firstTime) {
-            if (config_.getReceiverQueueSize() != 0) {
-                sendFlowPermitsToBroker(cnx, config_.getReceiverQueueSize());
-            } else if (messageListener_) {
-                sendFlowPermitsToBroker(cnx, 1);
-            }
+        if (config_.getReceiverQueueSize() != 0) {
+            sendFlowPermitsToBroker(cnx, config_.getReceiverQueueSize());
+        } else if (messageListener_) {
+            sendFlowPermitsToBroker(cnx, 1);
         }
         consumerCreatedPromise_.setValue(get_shared_this_ptr());
     } else {
@@ -326,13 +369,15 @@ Result ConsumerImpl::handleCreateConsumer(const ClientConnectionPtr& cnx, Result
             // Creating the consumer has timed out. We need to ensure the broker closes the consumer
             // in case it was indeed created, otherwise it might prevent new subscribe operation,
             // since we are not closing the connection
-            int requestId = client_.lock()->newRequestId();
-            cnx->sendRequestWithId(Commands::newCloseConsumer(consumerId_, requestId), requestId);
+            auto requestId = newRequestId();
+            cnx->sendRequestWithId(Commands::newCloseConsumer(consumerId_, requestId), requestId,
+                                   "CLOSE_CONSUMER");
         }
 
         if (consumerCreatedPromise_.isComplete()) {
-            // Consumer had already been initially created, we need to retry connecting in any case
+            // Clear the connection set before SUBSCRIBE so the next reconnect is not skipped.
             LOG_WARN(getName() << "Failed to reconnect consumer: " << strResult(result));
+            resetCnx();
             handleResult = ResultRetryable;
         } else {
             // Consumer was not yet created, retry to connect to broker if it's possible
@@ -350,12 +395,12 @@ Result ConsumerImpl::handleCreateConsumer(const ClientConnectionPtr& cnx, Result
     return handleResult;
 }
 
-void ConsumerImpl::unsubscribeAsync(ResultCallback originalCallback) {
+void ConsumerImpl::unsubscribeAsync(const ResultCallback& originalCallback) {
     LOG_INFO(getName() << "Unsubscribing");
 
     auto callback = [this, originalCallback](Result result) {
         if (result == ResultOk) {
-            shutdown();
+            internalShutdown();
             LOG_INFO(getName() << "Unsubscribed successfully");
         } else {
             state_ = Ready;
@@ -378,11 +423,12 @@ void ConsumerImpl::unsubscribeAsync(ResultCallback originalCallback) {
         LOG_DEBUG(getName() << "Unsubscribe request sent for consumer - " << consumerId_);
         ClientImplPtr client = client_.lock();
         lock.unlock();
-        int requestId = client->newRequestId();
+        auto requestId = newRequestId();
         SharedBuffer cmd = Commands::newUnsubscribe(consumerId_, requestId);
         auto self = get_shared_this_ptr();
-        cnx->sendRequestWithId(cmd, requestId)
-            .addListener([self, callback](Result result, const ResponseData&) { callback(result); });
+        cnx->sendRequestWithId(cmd, requestId, "UNSUBSCRIBE")
+            .addListener(
+                [self, callback](const Error& error, const ResponseData&) { callback(error.result); });
     } else {
         Result result = ResultNotConnected;
         lock.unlock();
@@ -391,7 +437,7 @@ void ConsumerImpl::unsubscribeAsync(ResultCallback originalCallback) {
     }
 }
 
-void ConsumerImpl::discardChunkMessages(std::string uuid, MessageId messageId, bool autoAck) {
+void ConsumerImpl::discardChunkMessages(const std::string& uuid, const MessageId& messageId, bool autoAck) {
     if (autoAck) {
         acknowledgeAsync(messageId, [uuid, messageId](Result result) {
             if (result != ResultOk) {
@@ -415,8 +461,8 @@ void ConsumerImpl::rememberAbandonedChunkedMessage(const std::string& uuid, bool
 }
 
 void ConsumerImpl::triggerCheckExpiredChunkedTimer() {
-    checkExpiredChunkedTimer_->expires_from_now(milliseconds(expireTimeOfIncompleteChunkedMessageMs_));
-    std::weak_ptr<ConsumerImplBase> weakSelf{shared_from_this()};
+    checkExpiredChunkedTimer_->expires_after(milliseconds(expireTimeOfIncompleteChunkedMessageMs_));
+    auto weakSelf = weak_from_this();
     checkExpiredChunkedTimer_->async_wait([this, weakSelf](const ASIO_ERROR& ec) -> void {
         auto self = weakSelf.lock();
         if (!self) {
@@ -455,19 +501,21 @@ bool ConsumerImpl::isValidChunkedMessageLayout(int64_t numChunks, int64_t totalC
            totalChunkMsgSize <= numChunks * maxMessageSize;
 }
 
-boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuffer& payload,
-                                                                const proto::MessageMetadata& metadata,
-                                                                const proto::MessageIdData& messageIdData,
-                                                                const ClientConnectionPtr& cnx,
-                                                                MessageId& messageId) {
+optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuffer& payload,
+                                                         const proto::MessageMetadata& metadata,
+                                                         const proto::MessageIdData& messageIdData,
+                                                         const ClientConnectionPtr& cnx,
+                                                         MessageId& messageId) {
     const auto chunkId = metadata.chunk_id();
-    const auto uuid = metadata.uuid();
+    const auto& uuid = metadata.uuid();
     LOG_DEBUG("Process message chunk (chunkId: " << chunkId << ", uuid: " << uuid
                                                  << ", messageId: " << messageId << ") of "
                                                  << payload.readableBytes() << " bytes");
-
     Lock lock(chunkProcessMutex_);
-
+    // For non-last chunks, increase available permits immediately since they don't occupy receiver queue.
+    if (chunkId != metadata.num_chunks_from_msg() - 1) {
+        increaseAvailablePermits(cnx);
+    }
     // Lazy task scheduling to expire incomplete chunk message
     bool expected = false;
     if (expireTimeOfIncompleteChunkedMessageMs_ > 0 &&
@@ -475,12 +523,21 @@ boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuff
         triggerCheckExpiredChunkedTimer();
     }
 
+    // Part 1: chunkId == 0, this is the first chunk of a chunked message.
+    // If a previous incomplete context with the same uuid exists, it means either:
+    //   a) Message redeliver: the first chunk's messageId matches one of the cached chunk messageIds.
+    //      In this case, the old context is simply removed and a new context is created to restart
+    //      assembling from scratch. No ack is needed since the old chunks will be redelivered.
+    //   b) Corrupted chunk message: the first chunk's messageId does NOT match any cached chunk messageId,
+    //      meaning a new producer sent a message with the same uuid. In this case, ack the old cached
+    //      chunks to avoid ack holes, then remove the old context and create a new one.
+    // After handling the old context, check maxPendingChunkedMessage limit and create a new context.
     auto it = chunkedMessageCache_.find(uuid);
 
     // The sizes come from the metadata written by the producer, and the bounds checks of `SharedBuffer`
     // are only assertions, so a malformed chunk would overflow the buffer of the assembled message.
     // Every chunk is at most one message, so the total size is bounded by the number of chunks.
-    auto discardMalformedChunk = [&](const char* reason) {
+    auto discardMalformedChunk = [&](const char* reason) -> optional<SharedBuffer> {
         LOG_ERROR(getName() << "Discarding a malformed chunk (" << reason << ", uuid: " << uuid
                             << ", chunkId: " << chunkId << ", numChunks: " << metadata.num_chunks_from_msg()
                             << ", totalChunkMsgSize: " << metadata.total_chunk_msg_size() << ", chunkSize: "
@@ -493,31 +550,74 @@ boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuff
         }
         rememberAbandonedChunkedMessage(uuid, false);
         lock.unlock();
-        discardCorruptedMessage(cnx, messageIdData, CommandAck_ValidationError_UncompressedSizeCorruption);
-        return boost::none;
+        // The permit of a chunk other than the last one was already returned at the entry.
+        discardCorruptedMessage(cnx, messageIdData, CommandAck_ValidationError_UncompressedSizeCorruption,
+                                chunkId == metadata.num_chunks_from_msg() - 1);
+        return {};
     };
 
     // The buffer of the assembled message is allocated from the size declared by the producer, and the
     // memory may be exhausted. The exception must not escape the IO thread of the connection. Do not
     // acknowledge the chunks, because the message is valid: close the connection instead, so that the
     // unacknowledged messages are redelivered after the consumer reconnects.
-    auto handleAllocationFailure = [&](const std::exception& e) {
+    auto handleAllocationFailure = [&](const std::exception& e) -> optional<SharedBuffer> {
         LOG_ERROR(getName() << "Failed to allocate memory for a chunked message (uuid: " << uuid
                             << ", chunkId: " << chunkId << ", totalChunkMsgSize: "
                             << metadata.total_chunk_msg_size() << ", messageId: " << messageId
                             << "): " << e.what());
         chunkedMessageCache_.remove(uuid);
         lock.unlock();
-        cnx->close(ResultDisconnected);
-        return boost::none;
+        cnx->close(Error{ResultDisconnected, "Failed to allocate memory for a chunked message"});
+        return {};
     };
 
-    if (chunkId == 0 && it == chunkedMessageCache_.end()) {
+    if (chunkId == 0) {
+        // Handle ack hole when receiving duplicated first chunk.
+        // For example (message redeliver):
+        //     Chunk-1 sequence ID: 0, chunk ID: 0, msgID: 1:1
+        //     Chunk-2 sequence ID: 0, chunk ID: 1, msgID: 1:2
+        //     Chunk-3 sequence ID: 0, chunk ID: 0, msgID: 1:1
+        //     Chunk-4 sequence ID: 0, chunk ID: 1, msgID: 1:2
+        //     Chunk-5 sequence ID: 0, chunk ID: 2, msgID: 1:3
+        // For example (corrupted chunk message):
+        //     Chunk-1 sequence ID: 0, chunk ID: 0, msgID: 1:1
+        //     Chunk-2 sequence ID: 0, chunk ID: 1, msgID: 1:2
+        //     Chunk-3 sequence ID: 0, chunk ID: 0, msgID: 1:3
+        //     Chunk-4 sequence ID: 0, chunk ID: 1, msgID: 1:4
+        //     Chunk-5 sequence ID: 0, chunk ID: 2, msgID: 1:5
+        if (it != chunkedMessageCache_.end()) {
+            auto& existingCtx = it->second;
+            bool isCorruptedChunkMessage = true;
+            for (const MessageId& cachedMsgId : existingCtx.getChunkedMessageIds()) {
+                if (cachedMsgId.ledgerId() == messageId.ledgerId() &&
+                    cachedMsgId.entryId() == messageId.entryId()) {
+                    isCorruptedChunkMessage = false;
+                    break;
+                }
+            }
+            if (isCorruptedChunkMessage) {
+                for (const MessageId& cachedMsgId : existingCtx.getChunkedMessageIds()) {
+                    LOG_INFO("Acking corrupted chunk message to avoid ack hole, uuid: "
+                             << uuid << ", messageId: " << cachedMsgId);
+                    acknowledgeAsync(cachedMsgId, [uuid, cachedMsgId](Result result) {
+                        if (result != ResultOk) {
+                            LOG_ERROR("Failed to acknowledge corrupted chunk, uuid: "
+                                      << uuid << ", messageId: " << cachedMsgId);
+                        }
+                    });
+                }
+            }
+            LOG_WARN("Received a duplicated first chunk (uuid: "
+                     << uuid << ", messageId: " << messageId
+                     << "). Remove previous chunk context and restart assembling");
+            chunkedMessageCache_.remove(uuid);
+            it = chunkedMessageCache_.end();
+        }
         if (!isValidChunkedMessageLayout(metadata.num_chunks_from_msg(), metadata.total_chunk_msg_size(),
-                                         cnx->getMaxMessageSize())) {
+                                         cnx->getMaxMessageSize()) ||
+            static_cast<int64_t>(payload.readableBytes()) > metadata.total_chunk_msg_size()) {
             return discardMalformedChunk("invalid number of chunks or total size of the chunked message");
         }
-
         // The chunks of the evicted messages are valid, but they are neither delivered nor acknowledged. The
         // unacknowledged message tracker does not redeliver them: it is disabled by default and a consumer
         // of a multi-topic consumer removes the messages from it. Request their redelivery explicitly, so
@@ -547,59 +647,153 @@ boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuff
         try {
             it = chunkedMessageCache_.putIfAbsent(
                 uuid, ChunkedMessageCtx{metadata.num_chunks_from_msg(), metadata.total_chunk_msg_size()});
+            it->second.appendChunk(messageId, payload);
         } catch (const std::exception& e) {
             return handleAllocationFailure(e);
         }
+        lock.unlock();
+        return {};
     }
 
-    // A chunk other than the first one may arrive when its first chunk is missing, evicted or already
-    // expired, so check for the end iterator before dereferencing it.
-    if (it == chunkedMessageCache_.end() || !it->second.validateChunkId(chunkId)) {
-        std::set<MessageId> chunksToRedeliver;
-        bool redeliver = true;
-        if (it == chunkedMessageCache_.end()) {
+    // Part 2: chunkId != 0 but chunk context not found in cache.
+    // This happens when the first chunk was not received (e.g., consumer used seek() or started
+    // consuming from a specific message position that falls in the middle of a chunked message,
+    // or the context was evicted due to maxPendingChunkedMessage limit).
+    // In this case, the chunk message cannot be assembled, so just discard it.
+    if (it == chunkedMessageCache_.end()) {
+        auto startMessageId = getStartMessageId();
+        const bool filteredByStartMessageId = !config_.isStartMessageIdInclusive() && startMessageId &&
+                                              startMessageId->ledgerId() == messageId.ledgerId() &&
+                                              startMessageId->entryId() == messageId.entryId();
+        if (filteredByStartMessageId) {
+            LOG_INFO("Filtered the chunked message before the start message id (uuid: "
+                     << uuid << " chunkId: " << chunkId << ", messageId: " << messageId << ")");
+        } else {
             LOG_ERROR("Received an uncached chunk (uuid: " << uuid << " chunkId: " << chunkId
                                                            << ", messageId: " << messageId << ")");
-            auto abandonedIt = abandonedChunkedMessages_.find(uuid);
-            if (expireTimeOfIncompleteChunkedMessageMs_ > 0 && metadata.has_publish_time() &&
-                TimeUtils::currentTimeMillis() >
-                    static_cast<int64_t>(metadata.publish_time()) + expireTimeOfIncompleteChunkedMessageMs_) {
-                // The message is too old to be completed: acknowledge the chunk, as the Java client does.
-                // This also bounds the redelivery of the chunks whose first chunk never comes back.
-                redeliver = false;
-            } else if (abandonedIt != abandonedChunkedMessages_.end()) {
-                // The earlier chunks were either redelivered or acknowledged, do the same with this one.
-                redeliver = abandonedIt->second;
-            }
-        } else {
-            // The context is dropped: request redelivery of its chunks along with this one, so that the
-            // message can be assembled again from the first chunk.
-            LOG_ERROR("Received a chunk whose chunk id is invalid (uuid: "
-                      << uuid << " chunkId: " << chunkId << ", messageId: " << messageId << ")");
-            for (const MessageId& msgId : it->second.getChunkedMessageIds()) {
-                chunksToRedeliver.insert(msgId);
-            }
-            chunkedMessageCache_.remove(uuid);
-            rememberAbandonedChunkedMessage(uuid, true);
         }
-        if (redeliver) {
-            chunksToRedeliver.insert(messageId);
-        } else {
-            discardChunkMessages(uuid, messageId, true);
+        // If this is the last chunk, its permit was not returned at the entry of processMessageChunk,
+        // so we need to return it here to avoid permit leak.
+        if (chunkId == metadata.num_chunks_from_msg() - 1) {
+            increaseAvailablePermits(cnx);
+        }
+        // The uncached chunk cannot be assembled into a complete message.
+        // If the message has expired, acknowledge it directly to avoid ack holes. This also bounds the
+        // redelivery of the chunks whose first chunk never comes back. Otherwise, do with it what was done
+        // with the earlier chunks of the same message, if they were abandoned: acknowledge it if they were
+        // acknowledged, and request its redelivery if they were redelivered. The unacknowledged message
+        // tracker is not used, because it is disabled by default.
+        if (filteredByStartMessageId) {
+            lock.unlock();
+            trackMessage(messageId);
+            return {};
+        }
+        bool redeliver = true;
+        if (expireTimeOfIncompleteChunkedMessageMs_ > 0 &&
+            TimeUtils::currentTimeMillis() >
+                static_cast<long>(metadata.publish_time()) + expireTimeOfIncompleteChunkedMessageMs_) {
+            redeliver = false;
+        } else if (auto abandonedIt = abandonedChunkedMessages_.find(uuid);
+                   abandonedIt != abandonedChunkedMessages_.end()) {
+            redeliver = abandonedIt->second;
         }
         lock.unlock();
-        increaseAvailablePermits(cnx);
+        if (redeliver) {
+            redeliverMessages({messageId});
+        } else {
+            acknowledgeAsync(messageId, [uuid, messageId](Result result) {
+                if (result != ResultOk) {
+                    LOG_WARN("Failed to acknowledge uncached chunk, uuid: " << uuid
+                                                                            << ", messageId: " << messageId);
+                }
+            });
+        }
+        return {};
+    }
+
+    // Part 3: chunkId does not match the expected next chunk ID (out-of-order).
+    // Two sub-cases:
+    //   a) chunkId <= lastChunkedMessageId: duplicated chunk caused by redeliver or corruption.
+    //      Filter and ack the duplicated chunk if it's corrupted, then discard it.
+    //   b) chunkId > lastChunkedMessageId + 1: gap detected, the chunked message is corrupted.
+    //      Remove the context and ack the current chunk if it has expired.
+    auto& chunkedMsgCtx = it->second;
+    if (!chunkedMsgCtx.validateChunkId(chunkId)) {
+        const int lastChunkedMessageId = static_cast<int>(chunkedMsgCtx.getChunkedMessageIds().size()) - 1;
+        // For example (duplicated chunk):
+        //     Chunk-1 sequence ID: 0, chunk ID: 0, msgID: 1:1
+        //     Chunk-2 sequence ID: 0, chunk ID: 1, msgID: 1:2
+        //     Chunk-3 sequence ID: 0, chunk ID: 2, msgID: 1:3
+        //     Chunk-4 sequence ID: 0, chunk ID: 1, msgID: 1:4
+        //     Chunk-5 sequence ID: 0, chunk ID: 2, msgID: 1:5
+        //     Chunk-6 sequence ID: 0, chunk ID: 3, msgID: 1:6
+        if (chunkId <= lastChunkedMessageId) {
+            bool isCorruptedChunk = true;
+            for (const MessageId& cachedMsgId : chunkedMsgCtx.getChunkedMessageIds()) {
+                if (cachedMsgId.ledgerId() == messageId.ledgerId() &&
+                    cachedMsgId.entryId() == messageId.entryId()) {
+                    isCorruptedChunk = false;
+                    break;
+                }
+            }
+            LOG_WARN("Received a duplicated chunk message (uuid: "
+                     << uuid << " chunkId: " << chunkId << ", lastChunkedMessageId: " << lastChunkedMessageId
+                     << ", messageId: " << messageId << ")");
+            lock.unlock();
+            if (isCorruptedChunk) {
+                LOG_INFO("Acking corrupted duplicated chunk to avoid ack hole, uuid: "
+                         << uuid << ", messageId: " << messageId);
+                acknowledgeAsync(messageId, [uuid, messageId](Result result) {
+                    if (result != ResultOk) {
+                        LOG_WARN("Failed to acknowledge duplicated chunk, uuid: " << uuid << ", messageId: "
+                                                                                  << messageId);
+                    }
+                });
+            }
+            return {};
+        }
+        // chunkId > lastChunkedMessageId + 1, the chunked message is corrupted.
+        LOG_WARN("Received unexpected chunk (uuid: " << uuid << " chunkId: " << chunkId
+                                                     << ", lastChunkedMessageId: " << lastChunkedMessageId
+                                                     << ", messageId: " << messageId << ")");
+        // The context is dropped: request redelivery of its chunks, so that the message can be assembled
+        // again from the first chunk.
+        std::set<MessageId> chunksToRedeliver(chunkedMsgCtx.getChunkedMessageIds().begin(),
+                                              chunkedMsgCtx.getChunkedMessageIds().end());
+        chunkedMessageCache_.remove(uuid);
+        rememberAbandonedChunkedMessage(uuid, true);
+        // If this is the last chunk, its permit was not returned at the entry of processMessageChunk,
+        // so we need to return it here to avoid permit leak.
+        if (chunkId == metadata.num_chunks_from_msg() - 1) {
+            increaseAvailablePermits(cnx);
+        }
+        lock.unlock();
+        if (expireTimeOfIncompleteChunkedMessageMs_ > 0 &&
+            TimeUtils::currentTimeMillis() >
+                static_cast<long>(metadata.publish_time()) + expireTimeOfIncompleteChunkedMessageMs_) {
+            LOG_INFO("Acking corrupted gap chunk to avoid ack hole, uuid: " << uuid
+                                                                            << ", messageId: " << messageId);
+            acknowledgeAsync(messageId, [uuid, messageId](Result result) {
+                if (result != ResultOk) {
+                    LOG_WARN("Failed to acknowledge gap chunk, uuid: " << uuid
+                                                                       << ", messageId: " << messageId);
+                }
+            });
+        } else {
+            chunksToRedeliver.insert(messageId);
+        }
         if (!chunksToRedeliver.empty()) {
             redeliverMessages(chunksToRedeliver);
         }
-        return boost::none;
+        return {};
     }
 
-    auto& chunkedMsgCtx = it->second;
+    // Part 4: chunkId matches the expected next chunk ID, append chunk payload.
+    // If all chunks have been received, assemble the full message, build a ChunkMessageId
+    // containing all individual chunk message IDs, and return the uncompressed payload.
     if (payload.readableBytes() > chunkedMsgCtx.getBuffer().writableBytes()) {
         return discardMalformedChunk("the chunks are bigger than the total size of the chunked message");
     }
-
     try {
         chunkedMsgCtx.appendChunk(messageId, payload);
     } catch (const std::exception& e) {
@@ -607,27 +801,21 @@ boost::optional<SharedBuffer> ConsumerImpl::processMessageChunk(const SharedBuff
     }
     if (!chunkedMsgCtx.isCompleted()) {
         lock.unlock();
-        increaseAvailablePermits(cnx);
-        return boost::none;
+        return {};
     }
-
     if (chunkedMsgCtx.getBuffer().writableBytes() != 0) {
         return discardMalformedChunk("the chunks are smaller than the total size of the chunked message");
     }
-
     messageId = std::make_shared<ChunkMessageIdImpl>(chunkedMsgCtx.moveChunkedMessageIds())->build();
-
     LOG_DEBUG("Chunked message completed chunkId: " << chunkId << ", ChunkedMessageCtx: " << chunkedMsgCtx
                                                     << ", sequenceId: " << metadata.sequence_id());
-
     auto wholePayload = chunkedMsgCtx.getBuffer();
     chunkedMessageCache_.remove(uuid);
-    // The decompression may close the connection, which must not be done under the lock.
     lock.unlock();
     if (uncompressMessageIfNeeded(cnx, messageIdData, metadata, wholePayload, false)) {
         return wholePayload;
     } else {
-        return boost::none;
+        return {};
     }
 }
 
@@ -636,24 +824,27 @@ void ConsumerImpl::messageReceived(const ClientConnectionPtr& cnx, const proto::
                                    proto::MessageMetadata& metadata, SharedBuffer& payload) {
     LOG_DEBUG(getName() << "Received Message -- Size: " << payload.readableBytes());
 
-    if (!decryptMessageIfNeeded(cnx, msg, metadata, payload)) {
-        // Message was discarded or not consumed due to decryption failure
-        return;
-    }
-
     if (!isChecksumValid) {
         // Message discarded for checksum error
         discardCorruptedMessage(cnx, msg.message_id(), CommandAck_ValidationError_ChecksumMismatch);
         return;
     }
 
-    auto redeliveryCount = msg.redelivery_count();
-    const bool isMessageUndecryptable =
-        metadata.encryption_keys_size() > 0 && !config_.getCryptoKeyReader().get() &&
-        config_.getCryptoFailureAction() == ConsumerCryptoFailureAction::CONSUME;
+    auto encryptionContext = metadata.encryption_keys_size() > 0
+                                 ? optional<EncryptionContext>(std::in_place, metadata, false)
+                                 : std::nullopt;
+    const auto decryptionResult = decryptMessageIfNeeded(cnx, msg, encryptionContext, payload);
+    if (decryptionResult == DecryptionResult::FAILED) {
+        // Message was discarded or not consumed due to decryption failure
+        return;
+    } else if (decryptionResult == DecryptionResult::CONSUME_ENCRYPTED && encryptionContext.has_value()) {
+        // Message is encrypted, but we let the application consume it as-is
+        encryptionContext->setDecryptionFailed(true);
+    }
 
+    auto redeliveryCount = msg.redelivery_count();
     const bool isChunkedMessage = metadata.num_chunks_from_msg() > 1;
-    if (!isMessageUndecryptable && !isChunkedMessage) {
+    if (decryptionResult == DecryptionResult::SUCCESS && !isChunkedMessage) {
         if (!uncompressMessageIfNeeded(cnx, msg.message_id(), metadata, payload, true)) {
             // Message was discarded on decompression error
             return;
@@ -677,6 +868,7 @@ void ConsumerImpl::messageReceived(const ClientConnectionPtr& cnx, const proto::
     m.impl_->cnx_ = cnx.get();
     m.impl_->setTopicName(getTopicPtr());
     m.impl_->setRedeliveryCount(msg.redelivery_count());
+    m.impl_->encryptionContext_ = std::move(encryptionContext);
 
     if (metadata.has_schema_version()) {
         m.impl_->setSchemaVersion(metadata.schema_version());
@@ -686,14 +878,23 @@ void ConsumerImpl::messageReceived(const ClientConnectionPtr& cnx, const proto::
     LOG_DEBUG(getName() << " metadata.has_num_messages_in_batch() = "
                         << metadata.has_num_messages_in_batch());
 
+    const auto state = state_.load(std::memory_order_relaxed);
+    if (state == Closing || state == Closed) {
+        return;
+    }
+    if (!listenerExecutor_) {
+        LOG_ERROR(getName() << " listenerExecutor_ is null, discarding message to avoid null dereference");
+        increaseAvailablePermits(cnx);
+        return;
+    }
     uint32_t numOfMessageReceived = m.impl_->metadata.num_messages_in_batch();
-    if (this->ackGroupingTrackerPtr_->isDuplicate(m.getMessageId())) {
+    if (ackGroupingTrackerPtr_->isDuplicate(m.getMessageId())) {
         LOG_DEBUG(getName() << " Ignoring message as it was ACKed earlier by same consumer.");
         increaseAvailablePermits(cnx, numOfMessageReceived);
         return;
     }
 
-    if (metadata.has_num_messages_in_batch()) {
+    if (metadata.has_num_messages_in_batch() && decryptionResult == DecryptionResult::SUCCESS) {
         // Reject a malformed batch before constructing any message from it.
         if (!Commands::isValidBatchPayload(m.impl_->payload, metadata.num_messages_in_batch())) {
             LOG_ERROR(getName() << "Got corrupted batch message with " << metadata.num_messages_in_batch()
@@ -706,23 +907,20 @@ void ConsumerImpl::messageReceived(const ClientConnectionPtr& cnx, const proto::
             words[i] = msg.ack_set(i);
         }
         BitSet ackSet{std::move(words)};
-        Lock lock(mutex_);
         numOfMessageReceived = receiveIndividualMessagesFromBatch(cnx, m, ackSet, msg.redelivery_count());
     } else {
         // try convert key value data.
         m.impl_->convertPayloadToKeyValue(config_.getSchema());
 
-        const auto startMessageId = startMessageId_.get();
-        if (isPersistent_ && startMessageId &&
-            m.getMessageId().ledgerId() == startMessageId.value().ledgerId() &&
-            m.getMessageId().entryId() == startMessageId.value().entryId() &&
-            isPriorEntryIndex(m.getMessageId().entryId())) {
+        const auto startMessageId = getStartMessageId();
+        if (isPersistent_ && startMessageId && m.getMessageId().ledgerId() == startMessageId->ledgerId() &&
+            isPrior(m.getMessageId().entryId(), startMessageId->entryId())) {
             LOG_DEBUG(getName() << " Ignoring message from before the startMessageId: "
                                 << startMessageId.value());
             return;
         }
         if (redeliveryCount >= deadLetterPolicy_.getMaxRedeliverCount()) {
-            possibleSendToDeadLetterTopicMessages_.emplace(m.getMessageId(), std::vector<Message>{m});
+            possibleSendToDeadLetterTopicMessages_.put(m.getMessageId(), std::vector<Message>{m});
             if (redeliveryCount > deadLetterPolicy_.getMaxRedeliverCount()) {
                 redeliverUnacknowledgedMessages({m.getMessageId()});
                 increaseAvailablePermits(cnx);
@@ -737,8 +935,11 @@ void ConsumerImpl::messageReceived(const ClientConnectionPtr& cnx, const proto::
             return;
         }
         // Trigger message listener callback in a separate thread
-        while (numOfMessageReceived--) {
-            listenerExecutor_->postWork(std::bind(&ConsumerImpl::internalListener, get_shared_this_ptr()));
+        if (listenerExecutor_) {
+            while (numOfMessageReceived--) {
+                listenerExecutor_->postWork(
+                    std::bind(&ConsumerImpl::internalListener, get_shared_this_ptr()));
+            }
         }
     }
 }
@@ -747,6 +948,24 @@ void ConsumerImpl::activeConsumerChanged(bool isActive) {
     if (eventListener_) {
         listenerExecutor_->postWork(
             std::bind(&ConsumerImpl::internalConsumerChangeListener, get_shared_this_ptr(), isActive));
+    }
+}
+
+void ConsumerImpl::reachedEndOfTopic() {
+    hasReachedEndOfTopic_ = true;
+    // If nothing is buffered there is nothing left to deliver, so complete any waiting async
+    // receives with ResultTopicTerminated now. When messages are still buffered they drain through
+    // the normal path first, and the next receive observes the flag (see receiveAsync).
+    Lock lock(pendingReceiveMutex_);
+    if (incomingMessages_.empty()) {
+        Message msg;
+        while (!pendingReceives_.empty()) {
+            ReceiveCallback callback = pendingReceives_.front();
+            pendingReceives_.pop();
+            listenerExecutor_->postWork(std::bind(&ConsumerImpl::notifyPendingReceivedCallback,
+                                                  get_shared_this_ptr(), ResultTopicTerminated, msg,
+                                                  callback));
+        }
     }
 }
 
@@ -787,8 +1006,12 @@ void ConsumerImpl::executeNotifyCallback(Message& msg) {
 
     // has pending receive, direct callback.
     if (asyncReceivedWaiting) {
-        listenerExecutor_->postWork(std::bind(&ConsumerImpl::notifyPendingReceivedCallback,
-                                              get_shared_this_ptr(), ResultOk, msg, callback));
+        if (listenerExecutor_) {
+            listenerExecutor_->postWork(std::bind(&ConsumerImpl::notifyPendingReceivedCallback,
+                                                  get_shared_this_ptr(), ResultOk, msg, callback));
+        } else {
+            notifyPendingReceivedCallback(ResultOk, msg, callback);
+        }
         return;
     }
 
@@ -838,7 +1061,7 @@ uint32_t ConsumerImpl::receiveIndividualMessagesFromBatch(const ClientConnection
     auto batchSize = batchedMessage.impl_->metadata.num_messages_in_batch();
     LOG_DEBUG("Received Batch messages of size - " << batchSize
                                                    << " -- msgId: " << batchedMessage.getMessageId());
-    const auto startMessageId = startMessageId_.get();
+    const auto startMessageId = getStartMessageId();
 
     int skippedMessages = 0;
 
@@ -868,9 +1091,9 @@ uint32_t ConsumerImpl::receiveIndividualMessagesFromBatch(const ClientConnection
 
             // If we are receiving a batch message, we need to discard messages that were prior
             // to the startMessageId
-            if (isPersistent_ && msgId.ledgerId() == startMessageId.value().ledgerId() &&
-                msgId.entryId() == startMessageId.value().entryId() &&
-                isPriorBatchIndex(msgId.batchIndex())) {
+            if (isPersistent_ && msgId.ledgerId() == startMessageId->ledgerId() &&
+                msgId.entryId() == startMessageId->entryId() &&
+                isPrior(msgId.batchIndex(), startMessageId->batchIndex())) {
                 LOG_DEBUG(getName() << "Ignoring message from before the startMessageId"
                                     << msg.getMessageId());
                 ++skippedMessages;
@@ -889,7 +1112,7 @@ uint32_t ConsumerImpl::receiveIndividualMessagesFromBatch(const ClientConnection
     }
 
     if (!possibleToDeadLetter.empty()) {
-        possibleSendToDeadLetterTopicMessages_.emplace(batchedMessage.getMessageId(), possibleToDeadLetter);
+        possibleSendToDeadLetterTopicMessages_.put(batchedMessage.getMessageId(), possibleToDeadLetter);
         if (redeliveryCount > deadLetterPolicy_.getMaxRedeliverCount()) {
             redeliverUnacknowledgedMessages({batchedMessage.getMessageId()});
         }
@@ -902,17 +1125,18 @@ uint32_t ConsumerImpl::receiveIndividualMessagesFromBatch(const ClientConnection
     return batchSize - skippedMessages;
 }
 
-bool ConsumerImpl::decryptMessageIfNeeded(const ClientConnectionPtr& cnx, const proto::CommandMessage& msg,
-                                          const proto::MessageMetadata& metadata, SharedBuffer& payload) {
-    if (!metadata.encryption_keys_size()) {
-        return true;
+auto ConsumerImpl::decryptMessageIfNeeded(const ClientConnectionPtr& cnx, const proto::CommandMessage& msg,
+                                          const optional<EncryptionContext>& context, SharedBuffer& payload)
+    -> DecryptionResult {
+    if (!context.has_value()) {
+        return DecryptionResult::SUCCESS;
     }
 
     // If KeyReader is not configured throw exception based on config param
     if (!config_.isEncryptionEnabled()) {
         if (config_.getCryptoFailureAction() == ConsumerCryptoFailureAction::CONSUME) {
             LOG_WARN(getName() << "CryptoKeyReader is not implemented. Consuming encrypted message.");
-            return true;
+            return DecryptionResult::CONSUME_ENCRYPTED;
         } else if (config_.getCryptoFailureAction() == ConsumerCryptoFailureAction::DISCARD) {
             LOG_WARN(getName() << "Skipping decryption since CryptoKeyReader is not implemented and config "
                                   "is set to discard");
@@ -923,20 +1147,20 @@ bool ConsumerImpl::decryptMessageIfNeeded(const ClientConnectionPtr& cnx, const 
             auto messageId = MessageIdBuilder::from(msg.message_id()).build();
             unAckedMessageTrackerPtr_->add(messageId);
         }
-        return false;
+        return DecryptionResult::FAILED;
     }
 
     SharedBuffer decryptedPayload;
-    if (msgCrypto_->decrypt(metadata, payload, config_.getCryptoKeyReader(), decryptedPayload)) {
+    if (msgCrypto_->decrypt(*context, payload, config_.getCryptoKeyReader(), decryptedPayload)) {
         payload = decryptedPayload;
-        return true;
+        return DecryptionResult::SUCCESS;
     }
 
     if (config_.getCryptoFailureAction() == ConsumerCryptoFailureAction::CONSUME) {
         // Note, batch message will fail to consume even if config is set to consume
         LOG_WARN(
             getName() << "Decryption failed. Consuming encrypted message since config is set to consume.");
-        return true;
+        return DecryptionResult::CONSUME_ENCRYPTED;
     } else if (config_.getCryptoFailureAction() == ConsumerCryptoFailureAction::DISCARD) {
         LOG_WARN(getName() << "Discarding message since decryption failed and config is set to discard");
         discardCorruptedMessage(cnx, msg.message_id(), CommandAck_ValidationError_DecryptionError);
@@ -945,7 +1169,7 @@ bool ConsumerImpl::decryptMessageIfNeeded(const ClientConnectionPtr& cnx, const 
         auto messageId = MessageIdBuilder::from(msg.message_id()).build();
         unAckedMessageTrackerPtr_->add(messageId);
     }
-    return false;
+    return DecryptionResult::FAILED;
 }
 
 bool ConsumerImpl::uncompressMessageIfNeeded(const ClientConnectionPtr& cnx,
@@ -994,7 +1218,7 @@ bool ConsumerImpl::uncompressMessageIfNeeded(const ClientConnectionPtr& cnx,
         // are redelivered after the consumer reconnects.
         LOG_ERROR(getName() << "Failed to decompress message with " << uncompressedSize << " at "
                             << messageIdData.ledgerid() << ":" << messageIdData.entryid() << ": " << e.what());
-        cnx->close(ResultDisconnected);
+        cnx->close(Error{ResultDisconnected, "Failed to allocate memory to decompress a message"});
         return false;
     }
 
@@ -1010,7 +1234,8 @@ bool ConsumerImpl::uncompressMessageIfNeeded(const ClientConnectionPtr& cnx,
 
 void ConsumerImpl::discardCorruptedMessage(const ClientConnectionPtr& cnx,
                                            const proto::MessageIdData& messageId,
-                                           CommandAck_ValidationError validationError) {
+                                           CommandAck_ValidationError validationError,
+                                           bool increasePermits) {
     LOG_ERROR(getName() << "Discarding corrupted message at " << messageId.ledgerid() << ":"
                         << messageId.entryid());
 
@@ -1018,7 +1243,9 @@ void ConsumerImpl::discardCorruptedMessage(const ClientConnectionPtr& cnx,
                                         CommandAck_AckType_Individual, validationError);
 
     cnx->sendCommand(cmd);
-    increaseAvailablePermits(cnx);
+    if (increasePermits) {
+        increaseAvailablePermits(cnx);
+    }
 }
 
 void ConsumerImpl::internalListener() {
@@ -1033,7 +1260,7 @@ void ConsumerImpl::internalListener() {
     trackMessage(msg.getMessageId());
     try {
         consumerStatsBasePtr_->receivedMessage(msg, ResultOk);
-        lastDequedMessageId_ = msg.getMessageId();
+        setLastDequedMessageId(msg.getMessageId());
         Consumer consumer{get_shared_this_ptr()};
         Message interceptMsg = interceptors_->beforeConsume(Consumer(shared_from_this()), msg);
         messageListener_(consumer, interceptMsg);
@@ -1050,7 +1277,6 @@ Result ConsumerImpl::fetchSingleMessageFromBroker(Message& msg) {
     }
 
     // Using RAII for locking
-    ClientConnectionPtr currentCnx = getCnx().lock();
     Lock lock(mutexForReceiveWithZeroQueueSize);
 
     // Just being cautious
@@ -1059,9 +1285,18 @@ Result ConsumerImpl::fetchSingleMessageFromBroker(Message& msg) {
             getName() << "The incoming message queue should never be greater than 0 when Queue size is 0");
         incomingMessages_.clear();
     }
-    waitingForZeroQueueSizeMessage = true;
 
-    sendFlowPermitsToBroker(currentCnx, 1);
+    {
+        // Lock mutex_ to prevent a race condition with handleCreateConsumer.
+        // If handleCreateConsumer is executed after setting waitingForZeroQueueSizeMessage to true and
+        // before calling sendFlowPermitsToBroker, the result may be that a flow permit is sent twice.
+        Lock lock(mutex_);
+        waitingForZeroQueueSizeMessage = true;
+        // If connection_ is nullptr, sendFlowPermitsToBroker does nothing.
+        // In other words, a flow permit will not be sent until setCnx(cnx) is executed in
+        // handleCreateConsumer.
+        sendFlowPermitsToBroker(getCnx().lock(), 1);
+    }
 
     while (true) {
         if (!incomingMessages_.pop(msg)) {
@@ -1074,6 +1309,7 @@ Result ConsumerImpl::fetchSingleMessageFromBroker(Message& msg) {
             Lock localLock(mutex_);
             // if message received due to an old flow - discard it and wait for the message from the
             // latest flow command
+            ClientConnectionPtr currentCnx = getCnx().lock();
             if (msg.impl_->cnx_ == currentCnx.get()) {
                 waitingForZeroQueueSizeMessage = false;
                 // Can't use break here else it may trigger a race with connection opened.
@@ -1092,7 +1328,7 @@ Result ConsumerImpl::receive(Message& msg) {
     return res;
 }
 
-void ConsumerImpl::receiveAsync(ReceiveCallback callback) {
+void ConsumerImpl::receiveAsync(const ReceiveCallback& callback) {
     Message msg;
 
     // fail the callback if consumer is closing or closed
@@ -1101,19 +1337,50 @@ void ConsumerImpl::receiveAsync(ReceiveCallback callback) {
         return;
     }
 
-    Lock lock(pendingReceiveMutex_);
+    if (messageListener_) {
+        LOG_ERROR(getName() << "Can not receive when a listener has been set");
+        callback(ResultInvalidConfiguration, msg);
+        return;
+    }
+
+    Lock mutexlock(mutex_, std::defer_lock);
+    if (config_.getReceiverQueueSize() == 0) {
+        // Lock mutex_ to prevent a race condition with handleCreateConsumer.
+        // If handleCreateConsumer is executed after pushing the callback to pendingReceives_ and
+        // before calling sendFlowPermitsToBroker, the result may be that a flow permit is sent twice.
+        // Note that the order of lock acquisition must be mutex_ -> pendingReceiveMutex_,
+        // otherwise a deadlock will occur.
+        mutexlock.lock();
+    }
+
+    Lock pendingReceiveMutexLock(pendingReceiveMutex_);
     if (incomingMessages_.pop(msg, std::chrono::milliseconds(0))) {
-        lock.unlock();
+        pendingReceiveMutexLock.unlock();
+        if (config_.getReceiverQueueSize() == 0) {
+            mutexlock.unlock();
+        }
         messageProcessed(msg);
         msg = interceptors_->beforeConsume(Consumer(shared_from_this()), msg);
         callback(ResultOk, msg);
+    } else if (hasReachedEndOfTopic_) {
+        // Terminated topic with nothing left buffered: fail the receive rather than parking it
+        // forever waiting for a message that will never arrive.
+        pendingReceiveMutexLock.unlock();
+        if (config_.getReceiverQueueSize() == 0) {
+            mutexlock.unlock();
+        }
+        callback(ResultTopicTerminated, msg);
+    } else if (config_.getReceiverQueueSize() == 0) {
+        pendingReceives_.push(callback);
+        // If connection_ is nullptr, sendFlowPermitsToBroker does nothing.
+        // In other words, a flow permit will not be sent until setCnx(cnx) is executed in
+        // handleCreateConsumer.
+        sendFlowPermitsToBroker(getCnx().lock(), 1);
+        pendingReceiveMutexLock.unlock();
+        mutexlock.unlock();
     } else {
         pendingReceives_.push(callback);
-        lock.unlock();
-
-        if (config_.getReceiverQueueSize() == 0) {
-            sendFlowPermitsToBroker(getCnx().lock(), 1);
-        }
+        pendingReceiveMutexLock.unlock();
     }
 }
 
@@ -1129,6 +1396,13 @@ Result ConsumerImpl::receiveHelper(Message& msg) {
 
     if (config_.getReceiverQueueSize() == 0) {
         return fetchSingleMessageFromBroker(msg);
+    }
+
+    // A drained terminated topic has nothing left to deliver: fail fast instead of blocking
+    // forever, matching the async path. (A receive already parked in pop() when end-of-topic
+    // arrives still waits — the queue only wakes on a message or on close.)
+    if (hasReachedEndOfTopic_ && incomingMessages_.empty()) {
+        return ResultTopicTerminated;
     }
 
     if (!incomingMessages_.pop(msg)) {
@@ -1161,6 +1435,10 @@ Result ConsumerImpl::receiveHelper(Message& msg, int timeout) {
         return ResultInvalidConfiguration;
     }
 
+    if (hasReachedEndOfTopic_ && incomingMessages_.empty()) {
+        return ResultTopicTerminated;
+    }
+
     if (incomingMessages_.pop(msg, std::chrono::milliseconds(timeout))) {
         messageProcessed(msg);
         msg = interceptors_->beforeConsume(Consumer(shared_from_this()), msg);
@@ -1169,15 +1447,16 @@ Result ConsumerImpl::receiveHelper(Message& msg, int timeout) {
         if (state_ != Ready) {
             return ResultAlreadyClosed;
         }
+        // Waking up empty on a terminated topic means drained, not merely idle.
+        if (hasReachedEndOfTopic_ && incomingMessages_.empty()) {
+            return ResultTopicTerminated;
+        }
         return ResultTimeout;
     }
 }
 
 void ConsumerImpl::messageProcessed(Message& msg, bool track) {
-    Lock lock(mutexForMessageId_);
-    lastDequedMessageId_ = msg.getMessageId();
-    lock.unlock();
-
+    setLastDequedMessageId(msg.getMessageId());
     incomingMessagesSize_.fetch_sub(msg.getLength());
 
     ClientConnectionPtr currentCnx = getCnx().lock();
@@ -1194,21 +1473,41 @@ void ConsumerImpl::messageProcessed(Message& msg, bool track) {
     }
 }
 
+void ConsumerImpl::onClusterSwitching() {
+    {
+        LockGuard lock{mutex_};
+        incomingMessages_.clear();
+        startMessageId_ = startMessageIdFromConfig_;
+        lastDequedMessageId_ = MessageId::earliest();
+        lastMessageIdInBroker_ = MessageId::earliest();
+        seekStatus_ = SeekStatus::NOT_STARTED;
+        lastSeekArg_.reset();
+    }
+    setRedirectedClusterURI("");
+    ackGroupingTrackerPtr_->flushAndClean();
+}
+
 /**
  * Clear the internal receiver queue and returns the message id of what was the 1st message in the queue that
  * was
  * not seen by the application
  * `startMessageId_` is updated so that we can discard messages after delivery restarts.
+ * NOTE: `mutex_` must be locked before calling this method.
  */
 void ConsumerImpl::clearReceiveQueue() {
-    if (duringSeek()) {
-        if (!hasSoughtByTimestamp_.load(std::memory_order_acquire)) {
-            startMessageId_ = seekMessageId_.get();
-        }
-        SeekStatus expected = SeekStatus::COMPLETED;
-        if (seekStatus_.compare_exchange_strong(expected, SeekStatus::NOT_STARTED)) {
-            auto seekCallback = seekCallback_.release();
-            executor_->postWork([seekCallback] { seekCallback(ResultOk); });
+    if (seekStatus_ != SeekStatus::NOT_STARTED) {
+        // Flush the pending ACKs in case newly arrived messages are filtered out by the previous pending ACKs
+        ackGroupingTrackerPtr_->flushAndClean();
+        if (lastSeekArg_.has_value()) {
+            if (std::holds_alternative<MessageId>(lastSeekArg_.value())) {
+                startMessageId_ = std::get<MessageId>(lastSeekArg_.value());
+            } else {
+                // Invalidate startMessageId_ so that `isPrior` checks will be skipped, and
+                // `hasMessageAvailableAsync` won't use `startMessageId_` in compare.
+                startMessageId_ = std::nullopt;
+            }
+        } else {
+            LOG_ERROR(getName() << "SeekStatus is not NOT_STARTED but lastSeekArg_ is not set");
         }
         return;
     } else if (subscriptionMode_ == Commands::SubscriptionModeDurable) {
@@ -1290,7 +1589,7 @@ inline CommandSubscribe_InitialPosition ConsumerImpl::getInitialPosition() {
     BOOST_THROW_EXCEPTION(std::logic_error("Invalid InitialPosition enumeration value"));
 }
 
-void ConsumerImpl::acknowledgeAsync(const MessageId& msgId, ResultCallback callback) {
+void ConsumerImpl::acknowledgeAsync(const MessageId& msgId, const ResultCallback& callback) {
     auto pair = prepareIndividualAck(msgId);
     const auto& msgIdToAck = pair.first;
     const bool readyToAck = pair.second;
@@ -1304,7 +1603,7 @@ void ConsumerImpl::acknowledgeAsync(const MessageId& msgId, ResultCallback callb
     interceptors_->onAcknowledge(Consumer(shared_from_this()), ResultOk, msgId);
 }
 
-void ConsumerImpl::acknowledgeAsync(const MessageIdList& messageIdList, ResultCallback callback) {
+void ConsumerImpl::acknowledgeAsync(const MessageIdList& messageIdList, const ResultCallback& callback) {
     MessageIdList messageIdListToAck;
     // TODO: Need to check if the consumer is ready. Same to all other public methods
     for (auto&& msgId : messageIdList) {
@@ -1321,7 +1620,7 @@ void ConsumerImpl::acknowledgeAsync(const MessageIdList& messageIdList, ResultCa
     this->ackGroupingTrackerPtr_->addAcknowledgeList(messageIdListToAck, callback);
 }
 
-void ConsumerImpl::acknowledgeCumulativeAsync(const MessageId& msgId, ResultCallback callback) {
+void ConsumerImpl::acknowledgeCumulativeAsync(const MessageId& msgId, const ResultCallback& callback) {
     if (!isCumulativeAcknowledgementAllowed(config_.getConsumerType())) {
         interceptors_->onAcknowledgeCumulative(Consumer(shared_from_this()),
                                                ResultCumulativeAcknowledgementNotAllowedError, msgId);
@@ -1387,21 +1686,30 @@ std::pair<MessageId, bool> ConsumerImpl::prepareCumulativeAck(const MessageId& m
 
 void ConsumerImpl::negativeAcknowledge(const MessageId& messageId) {
     unAckedMessageTrackerPtr_->remove(messageId);
-    negativeAcksTracker_->add(messageId);
+    // If it's a ChunkMessageId, expand all chunk entries and nack them individually,
+    // so that the broker can redeliver all chunks
+    if (auto chunkMessageId =
+            std::dynamic_pointer_cast<ChunkMessageIdImpl>(Commands::getMessageIdImpl(messageId))) {
+        for (const auto& chunkId : chunkMessageId->getChunkedMessageIds()) {
+            negativeAcksTracker_->add(chunkId);
+        }
+    } else {
+        negativeAcksTracker_->add(messageId);
+    }
 }
 
-void ConsumerImpl::disconnectConsumer() { disconnectConsumer(boost::none); }
+void ConsumerImpl::disconnectConsumer() { disconnectConsumer(std::nullopt); }
 
-void ConsumerImpl::disconnectConsumer(const boost::optional<std::string>& assignedBrokerUrl) {
+void ConsumerImpl::disconnectConsumer(const optional<std::string>& assignedBrokerUrl) {
     LOG_INFO("Broker notification of Closed consumer: "
-             << consumerId_ << (assignedBrokerUrl ? (" assignedBrokerUrl: " + assignedBrokerUrl.get()) : ""));
+             << consumerId_ << (assignedBrokerUrl ? (" assignedBrokerUrl: " + *assignedBrokerUrl) : ""));
     resetCnx();
     scheduleReconnection(assignedBrokerUrl);
 }
 
-void ConsumerImpl::closeAsync(ResultCallback originalCallback) {
+void ConsumerImpl::closeAsync(const ResultCallback& originalCallback) {
     auto callback = [this, originalCallback](Result result, bool alreadyClosed = false) {
-        shutdown();
+        internalShutdown();
         if (result == ResultOk) {
             if (!alreadyClosed) {
                 LOG_INFO(getName() << "Closed consumer " << consumerId_);
@@ -1425,9 +1733,7 @@ void ConsumerImpl::closeAsync(ResultCallback originalCallback) {
     incomingMessages_.close();
 
     // Flush pending grouped ACK requests.
-    if (ackGroupingTrackerPtr_) {
-        ackGroupingTrackerPtr_->close();
-    }
+    ackGroupingTrackerPtr_->close();
     negativeAcksTracker_->close();
 
     ClientConnectionPtr cnx = getCnx().lock();
@@ -1446,18 +1752,18 @@ void ConsumerImpl::closeAsync(ResultCallback originalCallback) {
 
     cancelTimers();
 
-    int requestId = client->newRequestId();
+    auto requestId = newRequestId();
     auto self = get_shared_this_ptr();
-    cnx->sendRequestWithId(Commands::newCloseConsumer(consumerId_, requestId), requestId)
-        .addListener([self, callback](Result result, const ResponseData&) { callback(result); });
+    cnx->sendRequestWithId(Commands::newCloseConsumer(consumerId_, requestId), requestId, "CLOSE_CONSUMER")
+        .addListener([self, callback](const Error& error, const ResponseData&) { callback(error.result); });
 }
 
 const std::string& ConsumerImpl::getName() const { return consumerStr_; }
 
-void ConsumerImpl::shutdown() {
-    if (ackGroupingTrackerPtr_) {
-        ackGroupingTrackerPtr_->close();
-    }
+void ConsumerImpl::shutdown() { internalShutdown(); }
+
+void ConsumerImpl::internalShutdown() {
+    ackGroupingTrackerPtr_->close();
     incomingMessages_.clear();
     possibleSendToDeadLetterTopicMessages_.clear();
     resetCnx();
@@ -1550,7 +1856,19 @@ void ConsumerImpl::redeliverMessages(const std::set<MessageId>& messageIds) {
     ClientConnectionPtr cnx = getCnx().lock();
     if (cnx) {
         if (cnx->getServerProtocolVersion() >= proto::v2) {
-            cnx->sendCommand(Commands::newRedeliverUnacknowledgedMessages(consumerId_, messageIds));
+            // Expand ChunkMessageIds into all chunk entries to ensure the broker
+            // can redeliver all chunks
+            std::set<MessageId> expandedMsgIds;
+            for (const auto& msgId : messageIds) {
+                if (auto chunkMsgId =
+                        std::dynamic_pointer_cast<ChunkMessageIdImpl>(Commands::getMessageIdImpl(msgId))) {
+                    const auto& chunkIds = chunkMsgId->getChunkedMessageIds();
+                    expandedMsgIds.insert(chunkIds.begin(), chunkIds.end());
+                } else {
+                    expandedMsgIds.insert(msgId);
+                }
+            }
+            cnx->sendCommand(Commands::newRedeliverUnacknowledgedMessages(consumerId_, expandedMsgIds));
             LOG_DEBUG("Sending RedeliverUnacknowledgedMessages command for Consumer - " << getConsumerId());
         }
     } else {
@@ -1560,7 +1878,7 @@ void ConsumerImpl::redeliverMessages(const std::set<MessageId>& messageIds) {
 
 int ConsumerImpl::getNumOfPrefetchedMessages() const { return incomingMessages_.size(); }
 
-void ConsumerImpl::getBrokerConsumerStatsAsync(BrokerConsumerStatsCallback callback) {
+void ConsumerImpl::getBrokerConsumerStatsAsync(const BrokerConsumerStatsCallback& callback) {
     if (state_ != Ready) {
         LOG_ERROR(getName() << "Client connection is not open, please try again later.")
         callback(ResultConsumerNotInitialized, BrokerConsumerStats());
@@ -1581,8 +1899,7 @@ void ConsumerImpl::getBrokerConsumerStatsAsync(BrokerConsumerStatsCallback callb
     ClientConnectionPtr cnx = getCnx().lock();
     if (cnx) {
         if (cnx->getServerProtocolVersion() >= proto::v8) {
-            ClientImplPtr client = client_.lock();
-            uint64_t requestId = client->newRequestId();
+            auto requestId = newRequestId();
             LOG_DEBUG(getName() << " Sending ConsumerStats Command for Consumer - " << getConsumerId()
                                 << ", requestId - " << requestId);
 
@@ -1602,7 +1919,7 @@ void ConsumerImpl::getBrokerConsumerStatsAsync(BrokerConsumerStatsCallback callb
 }
 
 void ConsumerImpl::brokerConsumerStatsListener(Result res, BrokerConsumerStatsImpl brokerConsumerStats,
-                                               BrokerConsumerStatsCallback callback) {
+                                               const BrokerConsumerStatsCallback& callback) {
     if (res == ResultOk) {
         Lock lock(mutex_);
         brokerConsumerStats.setCacheTime(config_.getBrokerConsumerStatsCacheTimeInMs());
@@ -1614,7 +1931,7 @@ void ConsumerImpl::brokerConsumerStatsListener(Result res, BrokerConsumerStatsIm
     }
 }
 
-void ConsumerImpl::seekAsync(const MessageId& msgId, ResultCallback callback) {
+void ConsumerImpl::seekAsync(const MessageId& msgId, const ResultCallback& callback) {
     const auto state = state_.load();
     if (state == Closed || state == Closing) {
         LOG_ERROR(getName() << "Client connection already closed.");
@@ -1624,16 +1941,13 @@ void ConsumerImpl::seekAsync(const MessageId& msgId, ResultCallback callback) {
         return;
     }
 
-    ClientImplPtr client = client_.lock();
-    if (!client) {
-        LOG_ERROR(getName() << "Client is expired when seekAsync " << msgId);
-        return;
-    }
-    const auto requestId = client->newRequestId();
-    seekAsyncInternal(requestId, Commands::newSeek(consumerId_, requestId, msgId), SeekArg{msgId}, callback);
+    const auto requestId = newRequestId();
+    auto nonNullCallback = (callback != nullptr) ? callback : [](Result) {};
+    seekAsyncInternal(requestId, Commands::newSeek(consumerId_, requestId, msgId), SeekArg{msgId},
+                      std::move(nonNullCallback));
 }
 
-void ConsumerImpl::seekAsync(uint64_t timestamp, ResultCallback callback) {
+void ConsumerImpl::seekAsync(SeekTimestampType timestamp, const ResultCallback& callback) {
     const auto state = state_.load();
     if (state == Closed || state == Closing) {
         LOG_ERROR(getName() << "Client connection already closed.");
@@ -1643,47 +1957,65 @@ void ConsumerImpl::seekAsync(uint64_t timestamp, ResultCallback callback) {
         return;
     }
 
-    ClientImplPtr client = client_.lock();
-    if (!client) {
-        LOG_ERROR(getName() << "Client is expired when seekAsync " << timestamp);
-        return;
-    }
-    const auto requestId = client->newRequestId();
+    const auto requestId = newRequestId();
+    auto nonNullCallback = (callback != nullptr) ? callback : [](Result) {};
     seekAsyncInternal(requestId, Commands::newSeek(consumerId_, requestId, timestamp), SeekArg{timestamp},
-                      callback);
+                      std::move(nonNullCallback));
 }
 
 bool ConsumerImpl::isReadCompacted() { return readCompacted_; }
 
-void ConsumerImpl::hasMessageAvailableAsync(HasMessageAvailableCallback callback) {
+void ConsumerImpl::hasMessageAvailableAsync(const HasMessageAvailableCallback& callback) {
+    if (!incomingMessages_.empty()) {
+        callback(ResultOk, true);
+        return;
+    }
     bool compareMarkDeletePosition;
     {
-        std::lock_guard<std::mutex> lock{mutexForMessageId_};
+        LockGuard lock{mutex_};
         compareMarkDeletePosition =
-            (lastDequedMessageId_ == MessageId::earliest()) &&
-            (startMessageId_.get().value_or(MessageId::earliest()) == MessageId::latest());
+            // there is no message received by consumer, so we cannot compare the last position with the last
+            // received position
+            lastDequedMessageId_ == MessageId::earliest() &&
+            // If the start message id is latest, we should seek to the actual last message first.
+            (startMessageId_.value_or(MessageId::earliest()) == MessageId::latest() ||
+             // If there is a previous seek operation by timestamp, the start message id will be incorrect, so
+             // we cannot compare the start position with the last position.
+             (lastSeekArg_.has_value() && std::holds_alternative<SeekTimestampType>(lastSeekArg_.value())));
     }
-    if (compareMarkDeletePosition || hasSoughtByTimestamp_.load(std::memory_order_acquire)) {
+    if (compareMarkDeletePosition) {
         auto self = get_shared_this_ptr();
         getLastMessageIdAsync([self, callback](Result result, const GetLastMessageIdResponse& response) {
             if (result != ResultOk) {
                 callback(result, {});
                 return;
             }
-            auto handleResponse = [self, response, callback] {
+            bool lastSeekIsByTimestamp = false;
+            {
+                LockGuard lock{self->mutex_};
+                if (self->lastSeekArg_.has_value() &&
+                    std::holds_alternative<SeekTimestampType>(self->lastSeekArg_.value())) {
+                    lastSeekIsByTimestamp = true;
+                }
+            }
+            auto handleResponse = [self, lastSeekIsByTimestamp, response, callback] {
                 if (response.hasMarkDeletePosition() && response.getLastMessageId().entryId() >= 0) {
                     // We only care about comparing ledger ids and entry ids as mark delete position
                     // doesn't have other ids such as batch index
                     auto compareResult = compareLedgerAndEntryId(response.getMarkDeletePosition(),
                                                                  response.getLastMessageId());
-                    callback(ResultOk, self->config_.isStartMessageIdInclusive() ? compareResult <= 0
-                                                                                 : compareResult < 0);
+                    // When the consumer has sought by timestamp, broker will ignore the
+                    // startMessageIdInclusive config, so the compare should still be exclusive
+                    if (lastSeekIsByTimestamp || !self->config_.isStartMessageIdInclusive()) {
+                        callback(ResultOk, compareResult < 0);
+                    } else {
+                        callback(ResultOk, compareResult <= 0);
+                    }
                 } else {
                     callback(ResultOk, false);
                 }
             };
-            if (self->config_.isStartMessageIdInclusive() &&
-                !self->hasSoughtByTimestamp_.load(std::memory_order_acquire)) {
+            if (self->config_.isStartMessageIdInclusive() && !lastSeekIsByTimestamp) {
                 self->seekAsync(response.getLastMessageId(), [callback, handleResponse](Result result) {
                     if (result != ResultOk) {
                         callback(result, {});
@@ -1708,7 +2040,7 @@ void ConsumerImpl::hasMessageAvailableAsync(HasMessageAvailableCallback callback
     }
 }
 
-void ConsumerImpl::getLastMessageIdAsync(BrokerGetLastMessageIdCallback callback) {
+void ConsumerImpl::getLastMessageIdAsync(const BrokerGetLastMessageIdCallback& callback) {
     const auto state = state_.load();
     if (state == Closed || state == Closing) {
         LOG_ERROR(getName() << "Client connection already closed.");
@@ -1727,12 +2059,11 @@ void ConsumerImpl::getLastMessageIdAsync(BrokerGetLastMessageIdCallback callback
 
 void ConsumerImpl::internalGetLastMessageIdAsync(const BackoffPtr& backoff, TimeDuration remainTime,
                                                  const DeadlineTimerPtr& timer,
-                                                 BrokerGetLastMessageIdCallback callback) {
+                                                 const BrokerGetLastMessageIdCallback& callback) {
     ClientConnectionPtr cnx = getCnx().lock();
     if (cnx) {
         if (cnx->getServerProtocolVersion() >= proto::v12) {
-            ClientImplPtr client = client_.lock();
-            uint64_t requestId = client->newRequestId();
+            auto requestId = newRequestId();
             LOG_DEBUG(getName() << " Sending getLastMessageId Command for Consumer - " << getConsumerId()
                                 << ", requestId - " << requestId);
 
@@ -1741,9 +2072,10 @@ void ConsumerImpl::internalGetLastMessageIdAsync(const BackoffPtr& backoff, Time
                 .addListener([this, self, callback](Result result, const GetLastMessageIdResponse& response) {
                     if (result == ResultOk) {
                         LOG_DEBUG(getName() << "getLastMessageId: " << response);
-                        Lock lock(mutexForMessageId_);
-                        lastMessageIdInBroker_ = response.getLastMessageId();
-                        lock.unlock();
+                        {
+                            LockGuard lock{mutex_};
+                            lastMessageIdInBroker_ = response.getLastMessageId();
+                        }
                     } else {
                         LOG_ERROR(getName() << "Failed to getLastMessageId: " << result);
                     }
@@ -1763,7 +2095,7 @@ void ConsumerImpl::internalGetLastMessageIdAsync(const BackoffPtr& backoff, Time
         }
         remainTime -= next;
 
-        timer->expires_from_now(next);
+        timer->expires_after(next);
 
         auto self = shared_from_this();
         timer->async_wait([this, backoff, remainTime, timer, next, callback,
@@ -1799,76 +2131,90 @@ bool ConsumerImpl::isConnected() const { return !getCnx().expired() && state_ ==
 
 uint64_t ConsumerImpl::getNumberOfConnectedConsumer() { return isConnected() ? 1 : 0; }
 
-void ConsumerImpl::seekAsyncInternal(long requestId, SharedBuffer seek, const SeekArg& seekArg,
-                                     ResultCallback callback) {
+void ConsumerImpl::seekAsyncInternal(long requestId, const SharedBuffer& seek, const SeekArg& seekArg,
+                                     ResultCallback&& callback) {
     ClientConnectionPtr cnx = getCnx().lock();
     if (!cnx) {
         LOG_ERROR(getName() << " Client Connection not ready for Consumer");
         callback(ResultNotConnected);
         return;
     }
-
-    auto expected = SeekStatus::NOT_STARTED;
-    if (!seekStatus_.compare_exchange_strong(expected, SeekStatus::IN_PROGRESS)) {
-        LOG_ERROR(getName() << " attempted to seek " << seekArg << " when the status is "
-                            << static_cast<int>(expected));
+    bool hasPendingSeek = false;
+    // Save the previous last seek arg in case seek failed
+    decltype(lastSeekArg_) previousLastSeekArg;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (seekStatus_ != SeekStatus::NOT_STARTED) {
+            hasPendingSeek = true;
+        } else {
+            seekStatus_ = SeekStatus::IN_PROGRESS;
+            if (seekCallback_.has_value()) {
+                // This should never happen
+                LOG_ERROR(getName() << "Previous seek callback is not triggered unexpectedly");
+                executor_->postWork([callback{std::exchange(seekCallback_, std::nullopt).value()}] {
+                    callback(ResultTimeout);
+                });
+            }
+            seekCallback_ = std::move(callback);
+            previousLastSeekArg = lastSeekArg_;
+            lastSeekArg_ = seekArg;
+        }
+    }
+    if (hasPendingSeek) {
+        std::visit(
+            [this](auto&& arg) {
+                LOG_ERROR(getName() << "Attempted to seek " << arg << " when there is a pending seek");
+            },
+            seekArg);
         callback(ResultNotAllowedError);
         return;
     }
 
-    const auto originalSeekMessageId = seekMessageId_.get();
-    if (boost::get<uint64_t>(&seekArg)) {
-        hasSoughtByTimestamp_.store(true, std::memory_order_release);
-    } else {
-        seekMessageId_ = *boost::get<MessageId>(&seekArg);
-    }
-    seekStatus_ = SeekStatus::IN_PROGRESS;
-    seekCallback_ = std::move(callback);
-    LOG_INFO(getName() << " Seeking subscription to " << seekArg);
+    std::visit([this](auto&& arg) { LOG_INFO(getName() << "Seeking subscription to " << arg); }, seekArg);
 
-    std::weak_ptr<ConsumerImpl> weakSelf{get_shared_this_ptr()};
+    auto weakSelf = weak_from_this();
 
-    cnx->sendRequestWithId(seek, requestId)
-        .addListener([this, weakSelf, callback, originalSeekMessageId](Result result,
-                                                                       const ResponseData& responseData) {
+    cnx->sendRequestWithId(seek, requestId, "SEEK")
+        .addListener([this, weakSelf, previousLastSeekArg](const Error& error,
+                                                           const ResponseData& responseData) {
             auto self = weakSelf.lock();
             if (!self) {
-                callback(result);
                 return;
             }
-            if (result == ResultOk) {
-                LOG_INFO(getName() << "Seek successfully");
-                ackGroupingTrackerPtr_->flushAndClean();
-                incomingMessages_.clear();
-                Lock lock(mutexForMessageId_);
-                lastDequedMessageId_ = MessageId::earliest();
-                lock.unlock();
-                if (getCnx().expired()) {
-                    // It's during reconnection, complete the seek future after connection is established
+            if (error.result == ResultOk) {
+                LockGuard lock(mutex_);
+                if (getCnx().expired() || reconnectionPending_) {
+                    // Reconnection path: delay the seek callback until connectionOpened. clearReceiveQueue()
+                    // and handleCreateConsumer() (which clears incomingMessages_ under the lock) run before
+                    // the seek callback is invoked, so hasMessageAvailable() after seek sees cleared state.
                     seekStatus_ = SeekStatus::COMPLETED;
+                    LOG_INFO(getName() << "Delay the seek future until the reconnection is done");
                 } else {
-                    if (!hasSoughtByTimestamp_.load(std::memory_order_acquire)) {
-                        startMessageId_ = seekMessageId_.get();
+                    LOG_INFO(getName() << "Seek successfully");
+                    ackGroupingTrackerPtr_->flushAndClean();
+                    incomingMessages_.clear();
+                    if (lastSeekArg_.has_value() && std::holds_alternative<MessageId>(lastSeekArg_.value())) {
+                        startMessageId_ = std::get<MessageId>(lastSeekArg_.value());
                     }
-                    seekCallback_.release()(result);
-                }
+                    if (!seekCallback_.has_value()) {
+                        LOG_ERROR(getName() << "Seek callback is not set");
+                        return;
+                    }
+                    executor_->postWork(
+                        [self, callback{std::exchange(seekCallback_, std::nullopt).value()}]() {
+                            callback(ResultOk);
+                        });
+                    seekStatus_ = SeekStatus::NOT_STARTED;
+                }  // else: complete the seek future after connection is established
             } else {
-                LOG_ERROR(getName() << "Failed to seek: " << result);
-                seekMessageId_ = originalSeekMessageId;
+                LOG_ERROR(getName() << "Failed to seek: " << error.result);
+                LockGuard lock{mutex_};
                 seekStatus_ = SeekStatus::NOT_STARTED;
-                seekCallback_.release()(result);
+                lastSeekArg_ = previousLastSeekArg;
+                executor_->postWork([self, callback{std::exchange(seekCallback_, std::nullopt).value()},
+                                     result{error.result}]() { callback(result); });
             }
         });
-}
-
-bool ConsumerImpl::isPriorBatchIndex(int32_t idx) {
-    return config_.isStartMessageIdInclusive() ? idx < startMessageId_.get().value().batchIndex()
-                                               : idx <= startMessageId_.get().value().batchIndex();
-}
-
-bool ConsumerImpl::isPriorEntryIndex(int64_t idx) {
-    return config_.isStartMessageIdInclusive() ? idx < startMessageId_.get().value().entryId()
-                                               : idx <= startMessageId_.get().value().entryId();
 }
 
 bool ConsumerImpl::hasEnoughMessagesForBatchReceive() const {
@@ -1886,14 +2232,13 @@ std::shared_ptr<ConsumerImpl> ConsumerImpl::get_shared_this_ptr() {
 }
 
 void ConsumerImpl::cancelTimers() noexcept {
-    ASIO_ERROR ec;
-    batchReceiveTimer_->cancel(ec);
-    checkExpiredChunkedTimer_->cancel(ec);
+    cancelTimer(*batchReceiveTimer_);
+    cancelTimer(*checkExpiredChunkedTimer_);
     unAckedMessageTrackerPtr_->stop();
     consumerStatsBasePtr_->stop();
 }
 
-void ConsumerImpl::processPossibleToDLQ(const MessageId& messageId, ProcessDLQCallBack cb) {
+void ConsumerImpl::processPossibleToDLQ(const MessageId& messageId, const ProcessDLQCallBack& cb) {
     auto messages = possibleSendToDeadLetterTopicMessages_.find(messageId);
     if (!messages) {
         cb(false);
@@ -1909,19 +2254,20 @@ void ConsumerImpl::processPossibleToDLQ(const MessageId& messageId, ProcessDLQCa
             producerConfiguration.setSchema(config_.getSchema());
             producerConfiguration.setBlockIfQueueFull(false);
             producerConfiguration.setBatchingEnabled(false);
+            producerConfiguration.setChunkingEnabled(true);
             producerConfiguration.impl_->initialSubscriptionName =
                 deadLetterPolicy_.getInitialSubscriptionName();
             ClientImplPtr client = client_.lock();
             if (client) {
                 auto self = get_shared_this_ptr();
                 client->createProducerAsync(
-                    deadLetterPolicy_.getDeadLetterTopic(), producerConfiguration,
-                    [self](Result res, Producer producer) {
-                        if (res == ResultOk) {
-                            self->deadLetterProducer_->setValue(producer);
+                    deadLetterPolicy_.getDeadLetterTopic(), producerConfiguration, [self](const auto& v) {
+                        if (const auto* producer = std::get_if<Producer>(&v)) {
+                            self->deadLetterProducer_->setValue(*producer);
                         } else {
                             LOG_ERROR("Dead letter producer create exception with topic: "
-                                      << self->deadLetterPolicy_.getDeadLetterTopic() << " ex: " << res);
+                                      << self->deadLetterPolicy_.getDeadLetterTopic()
+                                      << " ex: " << std::get<Error>(v).result);
                             self->deadLetterProducer_.reset();
                         }
                     });
@@ -1933,9 +2279,9 @@ void ConsumerImpl::processPossibleToDLQ(const MessageId& messageId, ProcessDLQCa
     }
 
     for (const auto& message : messages.value()) {
-        std::weak_ptr<ConsumerImpl> weakSelf{get_shared_this_ptr()};
-        deadLetterProducer_->getFuture().addListener([weakSelf, message, messageId, cb](Result res,
-                                                                                        Producer producer) {
+        auto weakSelf = weak_from_this();
+        deadLetterProducer_->getFuture().addListener([this, weakSelf, message, messageId, cb](
+                                                         Result res, Producer producer) {
             auto self = weakSelf.lock();
             if (!self) {
                 return;
@@ -1954,30 +2300,29 @@ void ConsumerImpl::processPossibleToDLQ(const MessageId& messageId, ProcessDLQCa
             if (message.hasOrderingKey()) {
                 msgBuilder.setOrderingKey(message.getOrderingKey());
             }
-            producer.sendAsync(msgBuilder.build(), [weakSelf, originMessageId, messageId, cb](
+            producer.sendAsync(msgBuilder.build(), [this, weakSelf, originMessageId, messageId, cb](
                                                        Result res, const MessageId& messageIdInDLQ) {
                 auto self = weakSelf.lock();
                 if (!self) {
                     return;
                 }
                 if (res == ResultOk) {
-                    if (self->state_ != Ready) {
+                    if (state_ != Ready) {
                         LOG_WARN(
                             "Send to the DLQ successfully, but consumer is not ready. ignore acknowledge : "
-                            << self->state_);
+                            << state_);
                         cb(false);
                         return;
                     }
-                    self->possibleSendToDeadLetterTopicMessages_.remove(messageId);
-                    self->acknowledgeAsync(originMessageId, [weakSelf, originMessageId, cb](Result result) {
+                    possibleSendToDeadLetterTopicMessages_.remove(messageId);
+                    acknowledgeAsync(originMessageId, [this, weakSelf, originMessageId, cb](Result result) {
                         auto self = weakSelf.lock();
                         if (!self) {
                             return;
                         }
                         if (result != ResultOk) {
-                            LOG_WARN("{" << self->topic() << "} {" << self->subscription_ << "} {"
-                                         << self->getConsumerName() << "} Failed to acknowledge the message {"
-                                         << originMessageId
+                            LOG_WARN("{" << topic() << "} {" << subscription_ << "} {" << getConsumerName()
+                                         << "} Failed to acknowledge the message {" << originMessageId
                                          << "} of the original topic but send to the DLQ successfully : "
                                          << result);
                             cb(false);
@@ -1988,15 +2333,112 @@ void ConsumerImpl::processPossibleToDLQ(const MessageId& messageId, ProcessDLQCa
                         }
                     });
                 } else {
-                    LOG_WARN("{" << self->topic() << "} {" << self->subscription_ << "} {"
-                                 << self->getConsumerName() << "} Failed to send DLQ message to {"
-                                 << self->deadLetterPolicy_.getDeadLetterTopic() << "} for message id "
+                    LOG_WARN("{" << topic() << "} {" << subscription_ << "} {" << getConsumerName()
+                                 << "} Failed to send DLQ message to {"
+                                 << deadLetterPolicy_.getDeadLetterTopic() << "} for message id "
                                  << "{" << originMessageId << "} : " << res);
                     cb(false);
                 }
             });
         });
     }
+}
+
+void ConsumerImpl::doImmediateAck(const ClientConnectionPtr& cnx, const MessageId& msgId,
+                                  CommandAck_AckType ackType, const ResultCallback& callback) {
+    const auto& ackSet = Commands::getMessageIdImpl(msgId)->getBitSet();
+    if (config_.isAckReceiptEnabled()) {
+        auto requestId = newRequestId();
+        cnx->sendRequestWithId(
+               Commands::newAck(consumerId_, msgId.ledgerId(), msgId.entryId(), ackSet, ackType, requestId),
+               requestId, "ACK")
+            .addListener([callback](const Error& error, const ResponseData&) {
+                if (callback) {
+                    callback(error.result);
+                }
+            });
+    } else {
+        cnx->sendCommand(Commands::newAck(consumerId_, msgId.ledgerId(), msgId.entryId(), ackSet, ackType));
+        if (callback) {
+            callback(ResultOk);
+        }
+    }
+}
+
+void ConsumerImpl::doImmediateAck(const ClientConnectionPtr& cnx, const std::set<MessageId>& msgIds,
+                                  const ResultCallback& callback) {
+    std::set<MessageId> ackMsgIds;
+
+    for (const auto& msgId : msgIds) {
+        if (auto chunkMessageId =
+                std::dynamic_pointer_cast<ChunkMessageIdImpl>(Commands::getMessageIdImpl(msgId))) {
+            auto msgIdList = chunkMessageId->getChunkedMessageIds();
+            ackMsgIds.insert(msgIdList.begin(), msgIdList.end());
+        } else {
+            ackMsgIds.insert(msgId);
+        }
+    }
+    if (Commands::peerSupportsMultiMessageAcknowledgement(cnx->getServerProtocolVersion())) {
+        if (config_.isAckReceiptEnabled()) {
+            auto requestId = newRequestId();
+            cnx->sendRequestWithId(Commands::newMultiMessageAck(consumerId_, ackMsgIds, requestId), requestId,
+                                   "ACK")
+                .addListener([callback](const Error& error, const ResponseData&) {
+                    if (callback) {
+                        callback(error.result);
+                    }
+                });
+        } else {
+            cnx->sendCommand(Commands::newMultiMessageAck(consumerId_, ackMsgIds));
+            if (callback) {
+                callback(ResultOk);
+            }
+        }
+    } else {
+        auto count = std::make_shared<std::atomic<size_t>>(ackMsgIds.size());
+        auto wrappedCallback = [callback, count](Result result) {
+            if (--*count == 0 && callback) {
+                callback(result);
+            }
+        };
+        for (auto&& msgId : ackMsgIds) {
+            doImmediateAck(msgId, wrappedCallback, CommandAck_AckType_Individual);
+        }
+    }
+}
+
+void ConsumerImpl::doImmediateAck(const MessageId& msgId, const ResultCallback& callback,
+                                  CommandAck_AckType ackType) {
+    const auto cnx = getCnx().lock();
+    if (!cnx) {
+        if (callback) {
+            callback(ResultAlreadyClosed);
+        }
+        return;
+    }
+    if (ackType == CommandAck_AckType_Individual) {
+        // If it's individual ack, we need to acknowledge all message IDs in a chunked message Id
+        // If it's cumulative ack, we only need to ack the last message ID of a chunked message.
+        // ChunkedMessageId return last chunk message ID by default, so we don't need to handle it.
+        if (auto chunkMessageId =
+                std::dynamic_pointer_cast<ChunkMessageIdImpl>(Commands::getMessageIdImpl(msgId))) {
+            auto msgIdList = chunkMessageId->getChunkedMessageIds();
+            doImmediateAck(cnx, std::set<MessageId>(msgIdList.begin(), msgIdList.end()), callback);
+            return;
+        }
+    }
+    doImmediateAck(cnx, msgId, ackType, callback);
+}
+
+void ConsumerImpl::doImmediateAck(const std::set<MessageId>& msgIds, const ResultCallback& callback) {
+    const auto cnx = getCnx().lock();
+    if (!cnx) {
+        if (callback) {
+            callback(ResultAlreadyClosed);
+        }
+        return;
+    }
+    doImmediateAck(cnx, msgIds, callback);
 }
 
 } /* namespace pulsar */

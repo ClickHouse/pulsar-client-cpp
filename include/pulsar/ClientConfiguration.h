@@ -23,6 +23,7 @@
 #include <pulsar/Logger.h>
 #include <pulsar/defines.h>
 
+#include <cstdint>
 #include <functional>
 
 namespace pulsar {
@@ -34,7 +35,7 @@ class PULSAR_PUBLIC ClientConfiguration {
     ~ClientConfiguration();
     ClientConfiguration(const ClientConfiguration&);
     ClientConfiguration& operator=(const ClientConfiguration&);
-    enum ProxyProtocol
+    enum ProxyProtocol : uint8_t
     {
         SNI = 0
     };
@@ -70,14 +71,11 @@ class PULSAR_PUBLIC ClientConfiguration {
     /**
      * Set the authentication method to be used with the broker
      *
+     * You can get the configured authentication data in `ServiceInfo` returned by `Client::getServiceInfo`.
+     *
      * @param authentication the authentication data to use
      */
     ClientConfiguration& setAuth(const AuthenticationPtr& authentication);
-
-    /**
-     * @return the authentication data
-     */
-    Authentication& getAuth() const;
 
     /**
      * Set timeout on client operations (subscribe, create producer, close, unsubscribe)
@@ -91,6 +89,19 @@ class PULSAR_PUBLIC ClientConfiguration {
      * @return the client operations timeout in seconds
      */
     int getOperationTimeoutSeconds() const;
+
+    /**
+     * Set timeout on client operations (subscribe, create producer, close, unsubscribe) in milliseconds.
+     * Overrides the value set by setOperationTimeoutSeconds if called after it.
+     *
+     * @param timeoutMs the timeout in milliseconds after which the operation will be considered as failed
+     */
+    ClientConfiguration& setOperationTimeoutMs(int timeoutMs);
+
+    /**
+     * @return the client operations timeout in milliseconds
+     */
+    int getOperationTimeoutMs() const;
 
     /**
      * Set the number of IO threads to be used by the Pulsar client. Default is 1
@@ -177,15 +188,49 @@ class PULSAR_PUBLIC ClientConfiguration {
     int getMaxBackoffIntervalMs() const;
 
     /**
-     * Configure a custom logger backend to route of Pulsar client library
+     * Configure whether to send authentication credentials when following HTTP redirects
+     * to a different host during lookup requests.
+     *
+     * When enabled, the Authorization header will be forwarded on cross-origin redirects.
+     *
+     * HTTP lookup redirects typically occur when the broker receiving the lookup request
+     * is not the owner of the requested topic. In this case, the broker responds with
+     * an HTTP redirect (3xx) pointing to the correct owner broker. If authentication is
+     * enabled, the redirected request needs to carry the auth credentials to be accepted
+     * by the target broker.
+     *
+     * If this option is not enabled and the cluster has authentication enabled, the
+     * redirected request will not carry credentials, which may result in a 401
+     * Unauthorized error from the target broker.
+     *
+     * The default value is false.
+     *
+     * @param allow whether to allow sending auth credentials on redirects
+     */
+    ClientConfiguration& setHttpLookupAuthAllowRedirect(bool allow);
+
+    /**
+     * @return whether auth credentials are sent on HTTP redirects
+     */
+    bool isHttpLookupAuthAllowRedirect() const;
+
+    /**
+     * Configure a custom logger backend to route Pulsar client library logs
      * to a different logger implementation.
      *
      * By default, log messages are printed on standard output.
      *
      * When passed in, the configuration takes ownership of the loggerFactory object.
-     * The logger factory can only be set once per process. Any subsequent calls to
-     * set the logger factory will have no effect, though the logger factory object
-     * will be cleaned up.
+     * The logger factory is process-wide and is not scoped to a Client instance.
+     * It can only be set once per process. Any subsequent calls to set the logger
+     * factory will have no effect, though the logger factory object will be
+     * cleaned up.
+     *
+     * Applications and language bindings that use callback-based logger factories
+     * should set the logger before creating clients and ensure callback state
+     * outlives all Pulsar clients and background threads that can emit logs.
+     * Avoid using per-client callback objects that can be destroyed while another
+     * client in the same process is still running.
      */
     ClientConfiguration& setLogger(LoggerFactory* loggerFactory);
 
@@ -211,20 +256,6 @@ class PULSAR_PUBLIC ClientConfiguration {
      * @return the connection validator callback, or an empty function if none was set
      */
     const ConnectionValidator& getConnectionValidator() const;
-
-    /**
-     * Configure whether to use the TLS encryption on the connections.
-     *
-     * The default value is false.
-     *
-     * @param useTls
-     */
-    ClientConfiguration& setUseTls(bool useTls);
-
-    /**
-     * @return whether the TLS encryption is used on the connections
-     */
-    bool isUseTls() const;
 
     /**
      * Set the path to the TLS private key file.
@@ -253,14 +284,12 @@ class PULSAR_PUBLIC ClientConfiguration {
     /**
      * Set the path to the trusted TLS certificate file.
      *
+     * You can get the configured trusted TLS certificate file path in `ServiceInfo` returned by
+     * `Client::getServiceInfo`.
+     *
      * @param tlsTrustCertsFilePath
      */
     ClientConfiguration& setTlsTrustCertsFilePath(const std::string& tlsTrustCertsFilePath);
-
-    /**
-     * @return the path to the trusted TLS certificate file
-     */
-    const std::string& getTlsTrustCertsFilePath() const;
 
     /**
      * Configure whether the Pulsar client accepts untrusted TLS certificates from brokers.
@@ -380,6 +409,19 @@ class PULSAR_PUBLIC ClientConfiguration {
      * The getter associated with setConnectionTimeout().
      */
     int getConnectionTimeout() const;
+
+    /**
+     * Set keep alive interval for each client-broker-connection. <i>(default: 30 seconds)</i>.
+     *
+     * @param keepAliveIntervalInSeconds
+     * @return
+     */
+    ClientConfiguration& setKeepAliveIntervalInSeconds(unsigned int keepAliveIntervalInSeconds);
+
+    /**
+     * The getter associated with setKeepAliveIntervalInSeconds().
+     */
+    unsigned int getKeepAliveIntervalInSeconds() const;
 
     friend class ClientImpl;
     friend class PulsarWrapper;

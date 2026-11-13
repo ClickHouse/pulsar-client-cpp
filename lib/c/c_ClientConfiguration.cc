@@ -115,14 +115,6 @@ void pulsar_client_configuration_set_logger_t(pulsar_client_configuration_t *con
     conf->conf.setLogger(new PulsarCLoggerFactory(logger));
 }
 
-void pulsar_client_configuration_set_use_tls(pulsar_client_configuration_t *conf, int useTls) {
-    conf->conf.setUseTls(useTls);
-}
-
-int pulsar_client_configuration_is_use_tls(pulsar_client_configuration_t *conf) {
-    return conf->conf.isUseTls();
-}
-
 void pulsar_client_configuration_set_validate_hostname(pulsar_client_configuration_t *conf,
                                                        int validateHostName) {
     conf->conf.setValidateHostName(validateHostName);
@@ -155,10 +147,6 @@ void pulsar_client_configuration_set_tls_trust_certs_file_path(pulsar_client_con
     conf->conf.setTlsTrustCertsFilePath(tlsTrustCertsFilePath);
 }
 
-const char *pulsar_client_configuration_get_tls_trust_certs_file_path(pulsar_client_configuration_t *conf) {
-    return conf->conf.getTlsTrustCertsFilePath().c_str();
-}
-
 void pulsar_client_configuration_set_tls_allow_insecure_connection(pulsar_client_configuration_t *conf,
                                                                    int allowInsecure) {
     conf->conf.setTlsAllowInsecureConnection(allowInsecure);
@@ -173,8 +161,7 @@ void pulsar_client_configuration_set_stats_interval_in_seconds(pulsar_client_con
     conf->conf.setStatsIntervalInSeconds(interval);
 }
 
-const unsigned int pulsar_client_configuration_get_stats_interval_in_seconds(
-    pulsar_client_configuration_t *conf) {
+unsigned int pulsar_client_configuration_get_stats_interval_in_seconds(pulsar_client_configuration_t *conf) {
     return conf->conf.getStatsIntervalInSeconds();
 }
 
@@ -197,4 +184,32 @@ void pulsar_client_configuration_set_listener_name(pulsar_client_configuration_t
 
 const char *pulsar_client_configuration_get_listener_name(pulsar_client_configuration_t *conf) {
     return conf->conf.getListenerName().c_str();
+}
+
+void pulsar_client_configuration_set_partitions_update_interval(pulsar_client_configuration_t *conf,
+                                                                const unsigned int intervalInSeconds) {
+    conf->conf.setPartititionsUpdateInterval(intervalInSeconds);
+}
+
+unsigned int pulsar_client_configuration_get_partitions_update_interval(pulsar_client_configuration_t *conf) {
+    return conf->conf.getPartitionsUpdateInterval();
+}
+
+void pulsar_client_configuration_set_keep_alive_interval_in_seconds(pulsar_client_configuration_t *conf,
+                                                                    unsigned int keepAliveIntervalInSeconds) {
+    conf->conf.setKeepAliveIntervalInSeconds(keepAliveIntervalInSeconds);
+}
+
+unsigned int pulsar_client_configuration_get_keep_alive_interval_in_seconds(
+    pulsar_client_configuration_t *conf) {
+    return conf->conf.getKeepAliveIntervalInSeconds();
+}
+
+void pulsar_client_configuration_set_http_lookup_auth_allow_redirect(pulsar_client_configuration_t *conf,
+                                                                     int httpLookupAuthAllowRedirect) {
+    conf->conf.setHttpLookupAuthAllowRedirect(httpLookupAuthAllowRedirect);
+}
+
+int pulsar_client_configuration_is_http_lookup_auth_allow_redirect(pulsar_client_configuration_t *conf) {
+    return conf->conf.isHttpLookupAuthAllowRedirect();
 }

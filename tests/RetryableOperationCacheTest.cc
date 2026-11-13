@@ -22,17 +22,18 @@
 #include <chrono>
 #include <stdexcept>
 
+#include "lib/ExecutorService.h"
 #include "lib/RetryableOperationCache.h"
 
 namespace pulsar {
 
-using IntFuture = Future<Result, int>;
+using IntFuture = Future<Error, int>;
 
 static int wait(IntFuture future) {
     int value;
-    auto result = future.get(value);
-    if (result != ResultOk) {
-        throw std::runtime_error(strResult(result));
+    auto error = future.get(value);
+    if (error.result != ResultOk) {
+        throw std::runtime_error(strResult(error.result));
     }
     return value;
 }
@@ -49,9 +50,9 @@ class CountdownFunc {
         : result_(rhs.result_), totalRetryCount_(rhs.totalRetryCount_), current_(rhs.current_.load()) {}
 
     IntFuture operator()() {
-        Promise<Result, int> promise;
+        Promise<Error, int> promise;
         if (++current_ < totalRetryCount_) {
-            promise.setFailed(ResultRetryable);
+            promise.setFailed({ResultRetryable, ""});
         } else {
             promise.setValue(result_);
         }
@@ -81,6 +82,18 @@ class RetryableOperationCacheTest : public ::testing::Test {
 }  // namespace pulsar
 
 using namespace pulsar;
+
+// Regression test: ExecutorServiceProvider(0) must not cause undefined behavior (e.g. idx % 0).
+// After fix, nthreads is clamped to at least 1, so get() returns a valid executor.
+TEST(ExecutorServiceProviderTest, ZeroThreadsReturnsValidExecutor) {
+    ExecutorServiceProviderPtr provider = std::make_shared<ExecutorServiceProvider>(0);
+    for (int i = 0; i < 3; i++) {
+        ExecutorServicePtr executor = provider->get();
+        ASSERT_NE(executor, nullptr)
+            << "get() must not return null when created with 0 threads (clamped to 1)";
+    }
+    provider->close();
+}
 
 TEST_F(RetryableOperationCacheTest, testRetry) {
     auto cache = RetryableOperationCache<int>::create(provider_, std::chrono::seconds(30));
@@ -118,17 +131,17 @@ TEST_F(RetryableOperationCacheTest, testTimeout) {
     }
 }
 
-TEST_F(RetryableOperationCacheTest, testClear) {
+TEST_F(RetryableOperationCacheTest, testClose) {
     auto cache = RetryableOperationCache<int>::create(provider_, std::chrono::seconds(30));
     for (int i = 0; i < 10; i++) {
         futures_.emplace_back(cache->run("key-" + std::to_string(i), CountdownFunc{100}));
     }
     ASSERT_EQ(getSize(*cache), 10);
-    cache->clear();
+    cache->close();
     for (auto&& future : futures_) {
         int value;
         // All cancelled futures complete with ResultDisconnected and the default int value
-        ASSERT_EQ(ResultDisconnected, future.get(value));
+        ASSERT_EQ(ResultDisconnected, future.get(value).result);
         ASSERT_EQ(value, 0);
     }
     ASSERT_EQ(getSize(*cache), 0);

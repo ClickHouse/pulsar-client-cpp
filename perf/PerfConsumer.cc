@@ -19,6 +19,8 @@
 #include <lib/LogUtils.h>
 DECLARE_LOG_OBJECT()
 
+// Don't remove this line because p_square_quantile.hpp requires including <algorithm> on some platforms
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <functional>
@@ -55,7 +57,6 @@ static int64_t currentTimeMillis() {
 struct Arguments {
     std::string authParams;
     std::string authPlugin;
-    bool isUseTls;
     bool isTlsAllowInsecureConnection;
     std::string tlsTrustCertsFilePath;
     std::string topic;
@@ -153,7 +154,6 @@ void handleSubscribe(Result result, Consumer consumer, Latch latch) {
 void startPerfConsumer(const Arguments& args) {
     ClientConfiguration conf;
 
-    conf.setUseTls(args.isUseTls);
     conf.setTlsAllowInsecureConnection(args.isTlsAllowInsecureConnection);
     if (!args.tlsTrustCertsFilePath.empty()) {
         std::string tlsTrustCertsFilePath(args.tlsTrustCertsFilePath);
@@ -259,9 +259,6 @@ int main(int argc, char** argv) {
 
         ("auth-plugin,a", po::value<std::string>(&args.authPlugin)->default_value(""),
          "Authentication plugin class library path")  //
-
-        ("use-tls,b", po::value<bool>(&args.isUseTls)->default_value(false),
-         "Whether tls connection is used")  //
 
         ("allow-insecure,d", po::value<bool>(&args.isTlsAllowInsecureConnection)->default_value(true),
          "Whether insecure tls connection is allowed")  //

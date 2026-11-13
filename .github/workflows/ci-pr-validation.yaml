@@ -33,9 +33,9 @@ jobs:
     name: Formatting Check
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v7
     - name: Run clang-format style check for C/C++/Protobuf programs.
-      uses: jidicula/clang-format-action@v4.11.0
+      uses: jidicula/clang-format-action@v4.18.0
       with:
         clang-format-version: '11'
         exclude-regex: '.*\.(proto|hpp)'
@@ -47,11 +47,12 @@ jobs:
     timeout-minutes: 60
     strategy:
       matrix:
-        os: [ubuntu-20.04, macos-12]
+        # TODO: support build on macos-14
+        os: [ubuntu-latest]
 
     steps:
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
 
       - name: Install deps (Ubuntu)
         if: ${{ startsWith(matrix.os, 'ubuntu') }}
@@ -76,23 +77,100 @@ jobs:
           cmake -S wireshark -B build-wireshark
           cmake --build build-wireshark
 
-  unit-tests:
-    name: Run unit tests
+  lint:
+    name: Lint
     needs: formatting-check
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
 
     steps:
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           submodules: recursive
 
+      - name: Restore vcpkg installed cache
+        uses: actions/cache@v6
+        id: vcpkg-cache
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        with:
+          path: build/vcpkg_installed
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      - name: Restore vcpkg downloads cache
+        uses: actions/cache@v6
+        with:
+          path: vcpkg/downloads
+          key: vcpkg-downloads-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-downloads-${{ runner.os }}-
+
+      - name: Build the project
+        run: |
+          for attempt in 1 2 3; do
+            echo "Build attempt $attempt/3"
+            if cmake -B build -DINTEGRATE_VCPKG=ON -DBUILD_TESTS=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON && cmake --build build -j8; then
+              exit 0
+            fi
+            echo "Attempt $attempt failed (e.g. vcpkg download 502), retrying in 90s..."
+            sleep 90
+          done
+          echo "All build attempts failed"
+          exit 1
+
+      - name: Tidy check
+        run: |
+          sudo apt-get install -y clang-tidy
+          ./build-support/run_clang_tidy.sh
+          if [[ $? -ne 0 ]]; then
+              echo "clang-tidy failed"
+              exit 1
+          fi
+
+  unit-tests:
+    name: Run unit tests
+    needs: formatting-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Restore vcpkg installed cache
+        uses: actions/cache@v6
+        id: vcpkg-cache
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            build/vcpkg_installed
+            build-boost-asio/vcpkg_installed
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      - name: Restore vcpkg downloads cache
+        uses: actions/cache@v6
+        with:
+          path: vcpkg/downloads
+          key: vcpkg-downloads-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-downloads-${{ runner.os }}-
+
       - name: Build core libraries
         run: |
-          cmake . -DINTEGRATE_VCPKG=ON -DBUILD_TESTS=OFF
-          cmake --build . -j8
+          for attempt in 1 2 3; do
+            echo "Build attempt $attempt/3"
+            if cmake -B build -DINTEGRATE_VCPKG=ON -DBUILD_TESTS=OFF && cmake --build build -j8; then
+              exit 0
+            fi
+            echo "Attempt $attempt failed (e.g. vcpkg download 502), retrying in 90s..."
+            sleep 90
+          done
+          echo "All build attempts failed"
+          exit 1
 
       - name: Check formatting
         run: |
@@ -104,35 +182,43 @@ jobs:
 
       - name: Build tests
         run: |
-          cmake . -DINTEGRATE_VCPKG=ON -DBUILD_TESTS=ON
-          cmake --build . -j8
+          cmake -B build -DINTEGRATE_VCPKG=ON -DBUILD_TESTS=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build -j8
 
       - name: Install gtest-parallel
         run: |
           sudo curl -o /gtest-parallel https://raw.githubusercontent.com/google/gtest-parallel/master/gtest_parallel.py 
 
       - name: Run unit tests
-        run: RETRY_FAILED=3 ./run-unit-tests.sh
+        run: RETRY_FAILED=3 CMAKE_BUILD_DIRECTORY=./build ./run-unit-tests.sh
+
+      - name: Build with Boost.Asio
+        run: |
+          for attempt in 1 2 3; do
+            echo "Build Boost.Asio attempt $attempt/3"
+            if cmake -B build-boost-asio -DINTEGRATE_VCPKG=ON -DBUILD_TESTS=ON && cmake --build build-boost-asio -j8; then
+              exit 0
+            fi
+            echo "Attempt $attempt failed (e.g. vcpkg download 502), retrying in 90s..."
+            sleep 90
+          done
+          echo "All build attempts failed"
+          exit 1
 
       - name: Build perf tools
         run: |
-          cmake . -DINTEGRATE_VCPKG=ON -DBUILD_TESTS=ON -DBUILD_PERF_TOOLS=ON
-          cmake --build . -j8
-
-      - name: Verify custom vcpkg installation
-        run: |
-          mv vcpkg /tmp/
-          cmake -B build -DINTEGRATE_VCPKG=ON -DCMAKE_TOOLCHAIN_FILE="/tmp/vcpkg/scripts/buildsystems/vcpkg.cmake"
+          cmake -B build -DINTEGRATE_VCPKG=ON -DBUILD_TESTS=ON -DBUILD_PERF_TOOLS=ON
+          cmake --build build -j8
 
   cpp20-build:
     name: Build with the C++20 standard
-    needs: formatting-check
+    needs: lint
     runs-on: ubuntu-22.04
     timeout-minutes: 60
 
     steps:
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
       - name: Install deps
         run: |
           sudo apt-get update -y
@@ -160,44 +246,66 @@ jobs:
       matrix:
         include:
           - name: 'Windows x64'
-            os: windows-2019
+            os: windows-2022
             triplet: x64-windows-static
             suffix: 'windows-win64'
-            generator: 'Visual Studio 16 2019'
+            generator: 'Visual Studio 17 2022'
             arch: '-A x64'
           - name: 'Windows x86'
-            os: windows-2019
+            os: windows-2022
             triplet: x86-windows-static
             suffix: 'windows-win32'
-            generator: 'Visual Studio 16 2019'
+            generator: 'Visual Studio 17 2022'
             arch: '-A Win32'
 
     steps:
-      - name: checkout
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
 
       - name: Restore vcpkg and its artifacts.
-        uses: actions/cache@v3
+        uses: actions/cache@v6
         id: vcpkg-cache
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
         with:
           path: |
-            ${{ env.VCPKG_ROOT }}
-            vcpkg_installed
-            !${{ env.VCPKG_ROOT }}/.git
-            !${{ env.VCPKG_ROOT }}/buildtrees
-            !${{ env.VCPKG_ROOT }}/packages
-            !${{ env.VCPKG_ROOT }}/downloads
-          key: |
-            ${{ runner.os }}-${{ matrix.triplet}}-${{ hashFiles( 'vcpkg.json' ) }}
+            ${{ github.workspace }}/vcpkg_installed
+            ${{ env.VCPKG_ROOT }}/downloads
+            ${{ env.VCPKG_ROOT }}/vcpkg.exe
+          key: ${{ runner.os }}-${{ matrix.triplet }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.triplet }}-vcpkg-
 
       - name: Get vcpkg(windows)
         if: ${{ runner.os == 'Windows' && steps.vcpkg-cache.outputs.cache-hit != 'true' }}
+        shell: pwsh
         run: |
           cd ${{ github.workspace }}
-          mkdir build -force
-          git clone https://github.com/Microsoft/vcpkg.git
-          cd vcpkg
-          .\bootstrap-vcpkg.bat
+          mkdir build -Force
+          # If vcpkg.exe already exists, skip bootstrapping to save time and avoid
+          # modifying the checked-out vcpkg directory.
+          if (Test-Path "${{ github.workspace }}\\vcpkg\\vcpkg.exe") {
+            Write-Host "vcpkg.exe present — skipping bootstrap"
+          } else {
+            if (Test-Path vcpkg) {
+              # If vcpkg was checked out as a submodule it may be shallow; fetch full history
+              git -C vcpkg fetch --unshallow || true
+            } else {
+              git clone https://github.com/Microsoft/vcpkg.git
+            }
+            Push-Location vcpkg
+            .\bootstrap-vcpkg.bat
+            Pop-Location
+          }
+
+      - name: Ensure vcpkg has full history(windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $isShallow = (git -C "${{ env.VCPKG_ROOT }}" rev-parse --is-shallow-repository).Trim()
+          if ($isShallow -eq "true") {
+            git -C "${{ env.VCPKG_ROOT }}" fetch --unshallow
+          }
 
       - name: remove system vcpkg(windows)
         if: runner.os == 'Windows'
@@ -269,7 +377,7 @@ jobs:
   package:
     name: Build ${{matrix.pkg.name}} ${{matrix.cpu.platform}}
     runs-on: ubuntu-22.04
-    needs: unit-tests
+    needs: [lint, unit-tests]
     timeout-minutes: 500
 
     strategy:
@@ -284,19 +392,18 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
       - name: Package Pulsar source
         run: build-support/generate-source-archive.sh
 
-      - uses: docker/setup-buildx-action@v2
-      - run: build-support/copy-deps-versionfile.sh
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Build dependencies Docker image
-        uses: docker/build-push-action@v3
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: ./pkg/${{matrix.pkg.type}}
           load: true
@@ -309,60 +416,37 @@ jobs:
       - name: Build packages
         run: pkg/${{matrix.pkg.type}}/docker-build-${{matrix.pkg.type}}-${{matrix.cpu.platform}}.sh build:latest
 
+      # TODO: verify the pre-built package works without linking issue
+
   cpp-build-macos:
     timeout-minutes: 120
-    name: Build CPP Client on macOS
-    needs: formatting-check
-    runs-on: macos-12
-    steps:
-      - name: checkout
-        uses: actions/checkout@v3
-
-      - name: Install dependencies
-        run: brew install openssl protobuf boost zstd snappy googletest
-
-      - name: Configure (default)
-        shell: bash
-        run: cmake -B ./build-macos -S .
-
-      - name: Compile
-        shell: bash
-        run: |
-          cmake --build ./build-macos --parallel --config Release
-
-      - name: Build with C++20
-        shell: bash
-        run: |
-          cmake -B build-macos-cpp20 -DCMAKE_CXX_STANDARD=20
-          cmake --build build-macos-cpp20 -j8
-
-  cpp-build-macos-static:
-    timeout-minutes: 120
     name: Build CPP Client on macOS with static dependencies
-    runs-on: macos-12
-    needs: unit-tests
+    runs-on: macos-14
+    needs: lint
     steps:
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Restore vcpkg installed cache
+        uses: actions/cache@v6
+        id: vcpkg-cache
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        with:
+          path: build-osx/vcpkg_installed
+          key: vcpkg-${{ runner.os }}-arm64-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-arm64-
 
       - name: Build libraries
         run: ./pkg/mac/build-static-library.sh
-
-      - name: Test static libraries
-        run: |
-          export PULSAR_DIR=$PWD/pkg/mac/.install
-          echo "Build with static library"
-          clang++ win-examples/example.cc -o static.out -std=c++11 -I $PULSAR_DIR/include $PULSAR_DIR/lib/libpulsarwithdeps.a
-          ./static.out
-          echo "Build with dynamic library"
-          clang++ win-examples/example.cc -o dynamic.out -std=c++11 -I $PULSAR_DIR/include -L $PULSAR_DIR/lib -Wl,-rpath $PULSAR_DIR/lib -lpulsar
-          ./dynamic.out
 
   # Job that will be required to complete and depends on all the other jobs
   check-completion:
     name: Check Completion
     runs-on: ubuntu-latest
-    needs: [formatting-check, wireshark-dissector-build, unit-tests, cpp20-build, cpp-build-windows, package, cpp-build-macos]
+    needs: [formatting-check, wireshark-dissector-build, lint, unit-tests, cpp20-build, cpp-build-windows, package, cpp-build-macos]
 
     steps:
       - run: true

@@ -31,6 +31,10 @@ class ConnectionFailTest : public ::testing::TestWithParam<int> {
         struct rlimit limit;
         ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &limit), 0);
         maxFdCount_ = limit.rlim_max;
+        // The previous test leaves the soft fd limit lowered, which could make the HTTP request below fail
+        // to open a socket. Restore it before creating the topic.
+        limit.rlim_cur = limit.rlim_max;
+        ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &limit), 0);
         int numPartitions = GetParam();
         topic_ = "test-connection-fail-" + std::to_string(numPartitions) + std::to_string(time(nullptr));
         if (numPartitions > 0) {
@@ -53,7 +57,7 @@ class ConnectionFailTest : public ::testing::TestWithParam<int> {
         limit.rlim_cur = fdLimit;
         limit.rlim_max = maxFdCount_;
         ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &limit), 0);
-        std::cout << "Updated fd limit to " << limit.rlim_cur << std::endl;
+        std::cout << "Updated fd limit to " << limit.rlim_cur << '\n';
     }
 };
 
@@ -88,7 +92,7 @@ TEST_P(ConnectionFailTest, test) {
             break;
         }
     }
-    std::cout << "Create producer, consumer and reader successfully when fdLimit is " << fdLimit << std::endl;
+    std::cout << "Create producer, consumer and reader successfully when fdLimit is " << fdLimit << '\n';
     ASSERT_TRUE(fdLimit < 100);
 }
 

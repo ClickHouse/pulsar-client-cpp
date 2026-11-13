@@ -102,6 +102,11 @@ class PulsarFriend {
         return *consumerImpl;
     }
 
+    static Result consumerHandleCreateConsumer(Consumer consumer, const ClientConnectionPtr& cnx,
+                                               Result result) {
+        return getConsumerImpl(consumer).handleCreateConsumer(cnx, result);
+    }
+
     static std::shared_ptr<ConsumerImpl> getConsumerImplPtr(Consumer consumer) {
         return std::static_pointer_cast<ConsumerImpl>(consumer.impl_);
     }
@@ -162,6 +167,46 @@ class PulsarFriend {
         return consumers;
     }
 
+    static size_t getPendingConsumerStatsRequests(const ClientConnection& cnx) {
+        std::lock_guard<std::mutex> lock(cnx.mutex_);
+        return cnx.pendingConsumerStatsMap_.size();
+    }
+
+    static size_t getPendingRequests(const ClientConnection& cnx) {
+        std::lock_guard<std::mutex> lock(cnx.mutex_);
+        return cnx.pendingRequests_.size();
+    }
+
+    static size_t getPendingLookupRequests(const ClientConnection& cnx) {
+        std::lock_guard<std::mutex> lock(cnx.mutex_);
+        return cnx.pendingLookupRequests_.size();
+    }
+
+    static size_t getNumOfPendingLookupRequests(const ClientConnection& cnx) {
+        std::lock_guard<std::mutex> lock(cnx.mutex_);
+        return cnx.numOfPendingLookupRequest_;
+    }
+
+    static size_t getPendingGetLastMessageIdRequests(const ClientConnection& cnx) {
+        std::lock_guard<std::mutex> lock(cnx.mutex_);
+        return cnx.pendingGetLastMessageIdRequests_.size();
+    }
+
+    static size_t getPendingGetTopicsOfNamespaceRequests(const ClientConnection& cnx) {
+        std::lock_guard<std::mutex> lock(cnx.mutex_);
+        return cnx.pendingGetNamespaceTopicsRequests_.size();
+    }
+
+    static size_t getPendingGetSchemaRequests(const ClientConnection& cnx) {
+        std::lock_guard<std::mutex> lock(cnx.mutex_);
+        return cnx.pendingGetSchemaRequests_.size();
+    }
+
+    static void setServerProtocolVersion(ClientConnection& cnx, int serverProtocolVersion) {
+        std::lock_guard<std::mutex> lock(cnx.mutex_);
+        cnx.serverProtocolVersion_ = serverProtocolVersion;
+    }
+
     static void setNegativeAckEnabled(Consumer consumer, bool enabled) {
         consumer.impl_->setNegativeAcknowledgeEnabledForTesting(enabled);
     }
@@ -216,6 +261,11 @@ class PulsarFriend {
         producerImpl->disconnectProducer();
         return waitUntil(std::chrono::seconds(3),
                          [producerImpl] { return !producerImpl->getCnx().expired(); });
+    }
+
+    static bool isTerminated(Producer producer) {
+        auto producerImpl = std::dynamic_pointer_cast<ProducerImpl>(producer.impl_);
+        return producerImpl && producerImpl->state_ == HandlerBase::Terminated;
     }
 };
 }  // namespace pulsar

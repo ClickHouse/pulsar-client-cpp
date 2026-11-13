@@ -19,6 +19,10 @@
 #ifndef PULSAR_CPP_HTTPLOOKUPSERVICE_H
 #define PULSAR_CPP_HTTPLOOKUPSERVICE_H
 
+#include <pulsar/ServiceInfo.h>
+
+#include <cstdint>
+
 #include "ClientImpl.h"
 #include "LookupService.h"
 #include "Url.h"
@@ -28,16 +32,16 @@ namespace pulsar {
 class ServiceNameResolver;
 using NamespaceTopicsPromise = Promise<Result, NamespaceTopicsPtr>;
 using NamespaceTopicsPromisePtr = std::shared_ptr<NamespaceTopicsPromise>;
-using GetSchemaPromise = Promise<Result, SchemaInfo>;
+using GetSchemaPromise = Promise<Error, SchemaInfo>;
 
 class HTTPLookupService : public LookupService, public std::enable_shared_from_this<HTTPLookupService> {
-    enum RequestType
+    enum RequestType : uint8_t
     {
         Lookup,
         PartitionMetaData
     };
 
-    typedef Promise<Result, LookupDataResultPtr> LookupPromise;
+    typedef Promise<Error, LookupDataResultPtr> LookupPromise;
 
     ExecutorServiceProviderPtr executorProvider_;
     ServiceNameResolver serviceNameResolver_;
@@ -50,27 +54,29 @@ class HTTPLookupService : public LookupService, public std::enable_shared_from_t
     bool isUseTls_;
     bool tlsAllowInsecure_;
     bool tlsValidateHostname_;
+    bool httpLookupAuthAllowRedirect_;
 
     static LookupDataResultPtr parsePartitionData(const std::string&);
     static LookupDataResultPtr parseLookupData(const std::string&);
     static NamespaceTopicsPtr parseNamespaceTopicsData(const std::string&);
 
-    void handleLookupHTTPRequest(LookupPromise, const std::string, RequestType);
-    void handleNamespaceTopicsHTTPRequest(NamespaceTopicsPromise promise, const std::string completeUrl);
-    void handleGetSchemaHTTPRequest(GetSchemaPromise promise, const std::string completeUrl);
+    void handleLookupHTTPRequest(const LookupPromise&, const std::string&, RequestType);
+    void handleNamespaceTopicsHTTPRequest(const NamespaceTopicsPromise& promise,
+                                          const std::string& completeUrl);
+    void handleGetSchemaHTTPRequest(const GetSchemaPromise& promise, const std::string& completeUrl);
 
-    Result sendHTTPRequest(std::string completeUrl, std::string& responseData);
+    Error sendHTTPRequest(const std::string& completeUrl, std::string& responseData);
 
-    Result sendHTTPRequest(std::string completeUrl, std::string& responseData, long& responseCode);
+    Error sendHTTPRequest(const std::string& completeUrl, std::string& responseData, long& responseCode);
 
    public:
-    HTTPLookupService(const std::string&, const ClientConfiguration&, const AuthenticationPtr&);
+    HTTPLookupService(const ServiceInfo& serviceInfo, const ClientConfiguration& config);
 
     LookupResultFuture getBroker(const TopicName& topicName) override;
 
-    Future<Result, LookupDataResultPtr> getPartitionMetadataAsync(const TopicNamePtr&) override;
+    Future<Error, LookupDataResultPtr> getPartitionMetadataAsync(const TopicNamePtr& topicName) override;
 
-    Future<Result, SchemaInfo> getSchema(const TopicNamePtr& topicName, const std::string& version) override;
+    Future<Error, SchemaInfo> getSchema(const TopicNamePtr& topicName, const std::string& version) override;
 
     Future<Result, NamespaceTopicsPtr> getTopicsOfNamespaceAsync(
         const NamespaceNamePtr& nsName, CommandGetTopicsOfNamespace_Mode mode) override;

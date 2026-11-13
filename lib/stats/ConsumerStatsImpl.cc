@@ -19,9 +19,6 @@
 
 #include "ConsumerStatsImpl.h"
 
-#include <functional>
-
-#include "lib/ExecutorService.h"
 #include "lib/LogUtils.h"
 #include "lib/Utils.h"
 
@@ -30,11 +27,9 @@ DECLARE_LOG_OBJECT();
 
 using Lock = std::unique_lock<std::mutex>;
 
-ConsumerStatsImpl::ConsumerStatsImpl(std::string consumerStr, ExecutorServicePtr executor,
+ConsumerStatsImpl::ConsumerStatsImpl(const std::string& consumerStr, DeadlineTimerPtr timer,
                                      unsigned int statsIntervalInSeconds)
-    : consumerStr_(consumerStr),
-      timer_(executor->createDeadlineTimer()),
-      statsIntervalInSeconds_(statsIntervalInSeconds) {}
+    : consumerStr_(consumerStr), timer_(std::move(timer)), statsIntervalInSeconds_(statsIntervalInSeconds) {}
 
 ConsumerStatsImpl::ConsumerStatsImpl(const ConsumerStatsImpl& stats)
     : consumerStr_(stats.consumerStr_),
@@ -64,7 +59,7 @@ void ConsumerStatsImpl::flushAndReset(const ASIO_ERROR& ec) {
     LOG_INFO(oss.str());
 }
 
-ConsumerStatsImpl::~ConsumerStatsImpl() { timer_->cancel(); }
+ConsumerStatsImpl::~ConsumerStatsImpl() { cancelTimer(*timer_); }
 
 void ConsumerStatsImpl::start() { scheduleTimer(); }
 
@@ -85,8 +80,8 @@ void ConsumerStatsImpl::messageAcknowledged(Result res, CommandAck_AckType ackTy
 }
 
 void ConsumerStatsImpl::scheduleTimer() {
-    timer_->expires_from_now(std::chrono::seconds(statsIntervalInSeconds_));
-    std::weak_ptr<ConsumerStatsImpl> weakSelf{shared_from_this()};
+    timer_->expires_after(std::chrono::seconds(statsIntervalInSeconds_));
+    auto weakSelf = weak_from_this();
     timer_->async_wait([this, weakSelf](const ASIO_ERROR& ec) {
         auto self = weakSelf.lock();
         if (!self) {

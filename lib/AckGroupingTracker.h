@@ -22,11 +22,7 @@
 #include <pulsar/MessageId.h>
 #include <pulsar/Result.h>
 
-#include <cstdint>
 #include <functional>
-#include <set>
-
-#include "ProtoApiEnums.h"
 
 namespace pulsar {
 
@@ -34,6 +30,9 @@ class ClientConnection;
 using ClientConnectionPtr = std::shared_ptr<ClientConnection>;
 using ClientConnectionWeakPtr = std::weak_ptr<ClientConnection>;
 using ResultCallback = std::function<void(Result)>;
+class ConsumerImpl;
+using ConsumerImplPtr = std::shared_ptr<ConsumerImpl>;
+using ConsumerImplWeakPtr = std::weak_ptr<ConsumerImpl>;
 
 /**
  * @class AckGroupingTracker
@@ -42,19 +41,12 @@ using ResultCallback = std::function<void(Result)>;
  */
 class AckGroupingTracker : public std::enable_shared_from_this<AckGroupingTracker> {
    public:
-    AckGroupingTracker(std::function<ClientConnectionPtr()> connectionSupplier,
-                       std::function<uint64_t()> requestIdSupplier, uint64_t consumerId, bool waitResponse)
-        : connectionSupplier_(connectionSupplier),
-          requestIdSupplier_(requestIdSupplier),
-          consumerId_(consumerId),
-          waitResponse_(waitResponse) {}
-
     virtual ~AckGroupingTracker() = default;
 
     /**
      * Start tracking the ACK requests.
      */
-    virtual void start() {}
+    virtual void start(const ConsumerImplPtr& consumer) { consumer_ = consumer; }
 
     /**
      * Since ACK requests are grouped and delayed, we need to do some best-effort duplicate check to
@@ -71,15 +63,21 @@ class AckGroupingTracker : public std::enable_shared_from_this<AckGroupingTracke
      * @param[in] msgId ID of the message to be ACKed.
      * @param[in] callback the callback that is triggered when the message is acknowledged
      */
-    virtual void addAcknowledge(const MessageId& msgId, ResultCallback callback) { callback(ResultOk); }
+    virtual void addAcknowledge(const MessageId& msgId, const ResultCallback& callback) {
+        if (callback) {
+            callback(ResultOk);
+        }
+    }
 
     /**
      * Adding message ID list into ACK group for individual ACK.
      * @param[in] msgIds of the message to be ACKed.
      * @param[in] callback the callback that is triggered when the messages are acknowledged
      */
-    virtual void addAcknowledgeList(const MessageIdList& msgIds, ResultCallback callback) {
-        callback(ResultOk);
+    virtual void addAcknowledgeList(const MessageIdList& msgIds, const ResultCallback& callback) {
+        if (callback) {
+            callback(ResultOk);
+        }
     }
 
     /**
@@ -87,19 +85,11 @@ class AckGroupingTracker : public std::enable_shared_from_this<AckGroupingTracke
      * @param[in] msgId ID of the message to be ACKed.
      * @param[in] callback the callback that is triggered when the message is acknowledged
      */
-    virtual void addAcknowledgeCumulative(const MessageId& msgId, ResultCallback callback) {
-        callback(ResultOk);
+    virtual void addAcknowledgeCumulative(const MessageId& msgId, const ResultCallback& callback) {
+        if (callback) {
+            callback(ResultOk);
+        }
     }
-
-    /**
-     * Flush all the pending grouped ACKs (as flush() does), and stop period ACKs sending.
-     */
-    virtual void close() {}
-
-    /**
-     * Flush all the pending grouped ACKs and send them to the broker.
-     */
-    virtual void flush() {}
 
     /**
      * Flush all the pending grouped ACKs (as flush() does), and clean all records about ACKed
@@ -107,17 +97,10 @@ class AckGroupingTracker : public std::enable_shared_from_this<AckGroupingTracke
      */
     virtual void flushAndClean() {}
 
-   protected:
-    void doImmediateAck(const MessageId& msgId, ResultCallback callback, CommandAck_AckType ackType) const;
-    void doImmediateAck(const std::set<MessageId>& msgIds, ResultCallback callback) const;
-
-   private:
-    const std::function<ClientConnectionPtr()> connectionSupplier_;
-    const std::function<uint64_t()> requestIdSupplier_;
-    const uint64_t consumerId_;
+    virtual void close() {}
 
    protected:
-    const bool waitResponse_;
+    ConsumerImplWeakPtr consumer_;
 
 };  // class AckGroupingTracker
 
