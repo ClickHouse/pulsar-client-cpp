@@ -20,6 +20,8 @@
 
 #include <zlib.h>
 
+#include <new>
+
 #include "LogUtils.h"
 
 DECLARE_LOG_OBJECT()
@@ -53,6 +55,11 @@ static bool buffer_uncompress(const char *compressedBuffer, unsigned long compre
     stream.opaque = NULL;
 
     int res = inflateInit2(&stream, MAX_WBITS);
+    // An allocation failure does not mean that the message is corrupted: throw, so that the consumer
+    // does not acknowledge a valid message but closes the connection to have it redelivered.
+    if (res == Z_MEM_ERROR) {
+        throw std::bad_alloc();
+    }
     if (res != Z_OK) {
         LOG_ERROR("Failed to initialize inflate stream: " << res);
         return false;
@@ -85,6 +92,10 @@ static bool buffer_uncompress(const char *compressedBuffer, unsigned long compre
     const uLong totalOut = stream.total_out;
     const uInt remainingIn = stream.avail_in;
     inflateEnd(&stream);
+
+    if (res == Z_MEM_ERROR) {
+        throw std::bad_alloc();
+    }
 
     // A complete zlib stream ends with `Z_STREAM_END` after its checksum was verified.
     // The Java client compresses with a sync flush and does not finish the stream, so

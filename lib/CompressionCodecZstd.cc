@@ -20,6 +20,9 @@
 
 #if HAS_ZSTD
 #include <zstd.h>
+#include <zstd_errors.h>
+
+#include <new>
 
 namespace pulsar {
 
@@ -47,6 +50,10 @@ bool CompressionCodecZstd::decode(const SharedBuffer& encoded, uint32_t uncompre
         decompressed.bytesWritten(uncompressedSize);
         decoded = decompressed;
         return true;
+    } else if (ZSTD_isError(result) && ZSTD_getErrorCode(result) == ZSTD_error_memory_allocation) {
+        // An allocation failure does not mean that the message is corrupted: throw, so that the consumer
+        // does not acknowledge a valid message but closes the connection to have it redelivered.
+        throw std::bad_alloc();
     } else {
         // Decompression failed
         return false;
