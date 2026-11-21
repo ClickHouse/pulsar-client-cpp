@@ -20,6 +20,8 @@
 
 #include <functional>
 
+#include "ChunkMessageIdImpl.h"
+#include "ClientConnection.h"
 #include "ClientImpl.h"
 #include "ConsumerImplBase.h"
 #include "ExecutorService.h"
@@ -32,13 +34,16 @@ namespace pulsar {
 
 void UnAckedMessageTrackerEnabled::timeoutHandler() {
     timeoutHandlerHelper();
-    ExecutorServicePtr executorService = client_->getIOExecutorProvider()->get();
+    auto client = client_.lock();
+    if (client == nullptr) {
+        return;
+    }
+    ExecutorServicePtr executorService = client->getIOExecutorProvider()->get();
     timer_ = executorService->createDeadlineTimer();
-    timer_->expires_from_now(std::chrono::milliseconds(tickDurationInMs_));
-    std::weak_ptr<UnAckedMessageTrackerEnabled> weakSelf{shared_from_this()};
+    timer_->expires_after(std::chrono::milliseconds(tickDurationInMs_));
+    auto weakSelf = weak_from_this();
     timer_->async_wait([weakSelf](const ASIO_ERROR& ec) {
-        auto self = weakSelf.lock();
-        if (self && !ec) {
+        if (auto self = weakSelf.lock(); self && !ec) {
             self->timeoutHandler();
         }
     });
@@ -54,9 +59,16 @@ void UnAckedMessageTrackerEnabled::timeoutHandlerHelper() {
 
     std::set<MessageId> msgIdsToRedeliver;
     if (!headPartition.empty()) {
-        LOG_INFO(consumerReference_.getName().c_str()
-                 << ": " << headPartition.size() << " Messages were not acked within "
-                 << timePartitions.size() * tickDurationInMs_ << " time");
+        auto cnx = consumerReference_.getCnx().lock();
+        if (cnx) {
+            LOG_WARN(consumerReference_.getName()
+                     << " Unacked messages timeout: " << headPartition.size() << " messages not acked within "
+                     << timeoutMs_ << " ms, connection: " << cnx->cnxString());
+        } else {
+            LOG_WARN(consumerReference_.getName()
+                     << " Unacked messages timeout: " << headPartition.size() << " messages not acked within "
+                     << timeoutMs_ << " ms, no connection");
+        }
         for (auto it = headPartition.begin(); it != headPartition.end(); it++) {
             msgIdsToRedeliver.insert(*it);
             messageIdPartitionMap.erase(*it);
@@ -73,12 +85,12 @@ void UnAckedMessageTrackerEnabled::timeoutHandlerHelper() {
     }
 }
 
-UnAckedMessageTrackerEnabled::UnAckedMessageTrackerEnabled(long timeoutMs, const ClientImplPtr client,
+UnAckedMessageTrackerEnabled::UnAckedMessageTrackerEnabled(long timeoutMs, const ClientImplPtr& client,
                                                            ConsumerImplBase& consumer)
     : UnAckedMessageTrackerEnabled(timeoutMs, timeoutMs, client, consumer) {}
 
 UnAckedMessageTrackerEnabled::UnAckedMessageTrackerEnabled(long timeoutMs, long tickDurationInMs,
-                                                           const ClientImplPtr client,
+                                                           const ClientImplPtr& client,
                                                            ConsumerImplBase& consumer)
     : consumerReference_(consumer),
       client_(client),
@@ -97,7 +109,18 @@ void UnAckedMessageTrackerEnabled::start() { timeoutHandler(); }
 
 bool UnAckedMessageTrackerEnabled::add(const MessageId& msgId) {
     std::lock_guard<std::recursive_mutex> acquire(lock_);
-    auto id = discardBatch(msgId);
+    // For ChunkMessageId, skip discardBatch to preserve the original ChunkMessageIdImpl.
+    //
+    // ChunkMessageIdImpl stores all chunk entries internally (chunkedMessageIds_), and its
+    // ledgerId/entryId are set to the last chunk's position. If discardBatch is applied, a
+    // new plain MessageIdImpl would be created, losing all chunk entries information.
+    //
+    // Although the set/map key only reflects the last chunk's position, the MessageId object
+    // itself retains the full ChunkMessageIdImpl via its impl_ pointer. So when ackTimeout
+    // triggers and the MessageId is passed to redeliverMessages(), it can be expanded into
+    // all chunk entries for redelivery, ensuring the broker redelivers the complete chunked
+    // message.
+    auto id = std::dynamic_pointer_cast<ChunkMessageIdImpl>(msgId.impl_) ? msgId : discardBatch(msgId);
     if (messageIdPartitionMap.count(id) == 0) {
         std::set<MessageId>& partition = timePartitions.back();
         bool emplace = messageIdPartitionMap.emplace(id, partition).second;
@@ -114,7 +137,9 @@ bool UnAckedMessageTrackerEnabled::isEmpty() {
 
 bool UnAckedMessageTrackerEnabled::remove(const MessageId& msgId) {
     std::lock_guard<std::recursive_mutex> acquire(lock_);
-    auto id = discardBatch(msgId);
+    // Keep consistent with add(): skip discardBatch for ChunkMessageId to ensure
+    // the same key is used for lookup and removal.
+    auto id = std::dynamic_pointer_cast<ChunkMessageIdImpl>(msgId.impl_) ? msgId : discardBatch(msgId);
     bool removed = false;
 
     std::map<MessageId, std::set<MessageId>&>::iterator exist = messageIdPartitionMap.find(id);
@@ -173,9 +198,8 @@ void UnAckedMessageTrackerEnabled::clear() {
 }
 
 void UnAckedMessageTrackerEnabled::stop() {
-    ASIO_ERROR ec;
     if (timer_) {
-        timer_->cancel(ec);
+        cancelTimer(*timer_);
     }
 }
 } /* namespace pulsar */

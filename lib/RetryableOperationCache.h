@@ -56,8 +56,13 @@ class RetryableOperationCache : public std::enable_shared_from_this<RetryableOpe
         return std::make_shared<Self>(PassKey{}, std::forward<Args>(args)...);
     }
 
-    Future<Result, T> run(const std::string& key, std::function<Future<Result, T>()>&& func) {
+    Future<Error, T> run(const std::string& key, std::function<Future<Error, T>()>&& func) {
         std::unique_lock<std::mutex> lock{mutex_};
+        if (closed_) {
+            Promise<Error, T> promise;
+            promise.setFailed({ResultAlreadyClosed, ""});
+            return promise.getFuture();
+        }
         auto it = operations_.find(key);
         if (it == operations_.end()) {
             DeadlineTimerPtr timer;
@@ -65,8 +70,8 @@ class RetryableOperationCache : public std::enable_shared_from_this<RetryableOpe
                 timer = executorProvider_->get()->createDeadlineTimer();
             } catch (const std::runtime_error& e) {
                 LOG_ERROR("Failed to retry lookup for " << key << ": " << e.what());
-                Promise<Result, T> promise;
-                promise.setFailed(ResultConnectError);
+                Promise<Error, T> promise;
+                promise.setFailed({ResultConnectError, e.what()});
                 return promise.getFuture();
             }
 
@@ -75,8 +80,8 @@ class RetryableOperationCache : public std::enable_shared_from_this<RetryableOpe
             operations_[key] = operation;
             lock.unlock();
 
-            std::weak_ptr<Self> weakSelf{this->shared_from_this()};
-            future.addListener([this, weakSelf, key, operation](Result, const T&) {
+            auto weakSelf = this->weak_from_this();
+            future.addListener([this, weakSelf, key, operation](const Error&, const T&) {
                 auto self = weakSelf.lock();
                 if (!self) {
                     return;
@@ -92,11 +97,15 @@ class RetryableOperationCache : public std::enable_shared_from_this<RetryableOpe
         }
     }
 
-    void clear() {
+    void close() {
         decltype(operations_) operations;
         {
             std::lock_guard<std::mutex> lock{mutex_};
+            if (closed_) {
+                return;
+            }
             operations.swap(operations_);
+            closed_ = true;
         }
         // cancel() could trigger the listener to erase the key from operations, so we should use a swap way
         // to release the lock here
@@ -110,6 +119,7 @@ class RetryableOperationCache : public std::enable_shared_from_this<RetryableOpe
     const TimeDuration timeout_;
 
     std::unordered_map<std::string, std::shared_ptr<RetryableOperation<T>>> operations_;
+    bool closed_{false};
     mutable std::mutex mutex_;
 
     DECLARE_LOG_OBJECT()

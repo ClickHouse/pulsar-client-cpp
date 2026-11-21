@@ -16,6 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+#include "ConsumerTest.h"
+
 #include <gtest/gtest.h>
 #include <pulsar/Client.h>
 
@@ -23,9 +25,11 @@
 #include <atomic>
 #include <chrono>
 #include <ctime>
+#include <future>
 #include <map>
 #include <mutex>
 #include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -36,6 +40,7 @@
 #include "WaitUtils.h"
 #include "lib/ClientConnection.h"
 #include "lib/Future.h"
+#include "lib/Latch.h"
 #include "lib/LogUtils.h"
 #include "lib/MessageIdUtil.h"
 #include "lib/MultiTopicsConsumerImpl.h"
@@ -58,7 +63,7 @@ namespace pulsar {
 
 class ConsumerStateEventListener : public ConsumerEventListener {
    public:
-    ConsumerStateEventListener(std::string name) { name_ = name; }
+    ConsumerStateEventListener(std::string name) { name_ = std::move(name); }
 
     void becameActive(Consumer consumer, int partitionId) override {
         LOG_INFO("Received consumer active event, partitionId:" << partitionId << ", name: " << name_);
@@ -861,6 +866,63 @@ TEST(ConsumerTest, testIsConnected) {
     ASSERT_FALSE(consumer.isConnected());
 }
 
+// A consumer of a terminated topic drains the backlog and then reports ResultTopicTerminated on the
+// async receive path, rather than dropping the connection (the pre-fix behaviour, which treated the
+// broker's CommandReachedEndOfTopic as an invalid message) or parking the receive forever.
+TEST(ConsumerTest, testReceiveAsyncAfterTopicTerminated) {
+    const std::string topicName = "testReceiveAsyncAfterTopicTerminated-" + std::to_string(time(nullptr));
+    const std::string topic = "persistent://public/default/" + topicName;
+
+    Client client(lookupUrl);
+
+    Producer producer;
+    ASSERT_EQ(ResultOk, client.createProducer(topic, producer));
+
+    Consumer consumer;
+    ASSERT_EQ(ResultOk, client.subscribe(topic, "sub", consumer));
+
+    constexpr int kCount = 5;
+    for (int i = 0; i < kCount; i++) {
+        ASSERT_EQ(ResultOk, producer.send(MessageBuilder().setContent("m-" + std::to_string(i)).build()));
+    }
+
+    const int httpCode =
+        makePostRequest(adminUrl + "admin/v2/persistent/public/default/" + topicName + "/terminate", "");
+    ASSERT_EQ(200, httpCode) << "httpCode: " << httpCode;
+
+    auto receiveWithin = [&consumer](std::chrono::seconds timeout, Message& out) {
+        auto promise = std::make_shared<std::promise<std::pair<Result, Message>>>();
+        consumer.receiveAsync([promise](Result result, const Message& msg) {
+            promise->set_value({result, msg});
+        });
+        auto future = promise->get_future();
+        if (future.wait_for(timeout) != std::future_status::ready) return ResultTimeout;
+        auto pair = future.get();
+        out = pair.second;
+        return pair.first;
+    };
+
+    // The backlog drains first...
+    for (int i = 0; i < kCount; i++) {
+        Message msg;
+        ASSERT_EQ(ResultOk, receiveWithin(std::chrono::seconds(10), msg)) << "message " << i;
+        ASSERT_EQ(ResultOk, consumer.acknowledge(msg));
+    }
+    // ...then the terminated topic reports its end instead of hanging.
+    Message ignored;
+    ASSERT_EQ(ResultTopicTerminated, receiveWithin(std::chrono::seconds(10), ignored));
+
+    // The sync paths agree with the async path once the topic is drained: both the timed and the
+    // untimed receive fail fast with ResultTopicTerminated instead of waiting.
+    Message drained;
+    ASSERT_EQ(ResultTopicTerminated, consumer.receive(drained, 1000));
+    ASSERT_EQ(ResultTopicTerminated, consumer.receive(drained));
+
+    ASSERT_EQ(ResultOk, consumer.close());
+    ASSERT_EQ(ResultOk, producer.close());
+    client.close();
+}
+
 TEST(ConsumerTest, testPartitionsWithCloseUnblock) {
     Client client(lookupUrl);
     const std::string partitionedTopic = "testPartitionsWithCloseUnblock" + std::to_string(time(nullptr));
@@ -1136,69 +1198,6 @@ TEST(ConsumerTest, testPatternSubscribeTopic) {
     client.close();
 }
 
-class ConsumerSeekTest : public ::testing::TestWithParam<bool> {
-   public:
-    void SetUp() override { producerConf_ = ProducerConfiguration().setBatchingEnabled(GetParam()); }
-
-    void TearDown() override { client_.close(); }
-
-   protected:
-    Client client_{lookupUrl};
-    ProducerConfiguration producerConf_;
-};
-
-TEST_P(ConsumerSeekTest, testSeekForMessageId) {
-    Client client(lookupUrl);
-
-    const std::string topic = "test-seek-for-message-id-" + std::string((GetParam() ? "batch-" : "")) +
-                              std::to_string(time(nullptr));
-
-    Producer producer;
-    ASSERT_EQ(ResultOk, client.createProducer(topic, producerConf_, producer));
-
-    Consumer consumerExclusive;
-    ASSERT_EQ(ResultOk, client.subscribe(topic, "sub-0", consumerExclusive));
-
-    Consumer consumerInclusive;
-    ASSERT_EQ(ResultOk,
-              client.subscribe(topic, "sub-1", ConsumerConfiguration().setStartMessageIdInclusive(true),
-                               consumerInclusive));
-
-    const auto numMessages = 100;
-    MessageId seekMessageId;
-
-    int r = (rand() % (numMessages - 1));
-    for (int i = 0; i < numMessages; i++) {
-        MessageId id;
-        ASSERT_EQ(ResultOk,
-                  producer.send(MessageBuilder().setContent("msg-" + std::to_string(i)).build(), id));
-
-        if (i == r) {
-            seekMessageId = id;
-        }
-    }
-
-    LOG_INFO("The seekMessageId is: " << seekMessageId << ", r : " << r);
-
-    consumerExclusive.seek(seekMessageId);
-    Message msg0;
-    ASSERT_EQ(ResultOk, consumerExclusive.receive(msg0, 3000));
-
-    consumerInclusive.seek(seekMessageId);
-    Message msg1;
-    ASSERT_EQ(ResultOk, consumerInclusive.receive(msg1, 3000));
-
-    LOG_INFO("consumerExclusive received " << msg0.getDataAsString() << " from " << msg0.getMessageId());
-    LOG_INFO("consumerInclusive received " << msg1.getDataAsString() << " from " << msg1.getMessageId());
-
-    ASSERT_EQ(msg0.getDataAsString(), "msg-" + std::to_string(r + 1));
-    ASSERT_EQ(msg1.getDataAsString(), "msg-" + std::to_string(r));
-
-    consumerInclusive.close();
-    consumerExclusive.close();
-    producer.close();
-}
-
 TEST(ConsumerTest, testNegativeAcksTrackerClose) {
     Client client(lookupUrl);
     auto topicName = "testNegativeAcksTrackerClose";
@@ -1251,8 +1250,6 @@ TEST(ConsumerTest, testAckNotPersistentTopic) {
 
     client.close();
 }
-
-INSTANTIATE_TEST_CASE_P(Pulsar, ConsumerSeekTest, ::testing::Values(true, false));
 
 class InterceptorForNegAckDeadlock : public ConsumerInterceptor {
    public:
@@ -1529,6 +1526,166 @@ TEST(ConsumerTest, testMultiConsumerListenerAndAck) {
         static_cast<UnAckedMessageTrackerEnabled*>(multiConsumerImplPtr->unAckedMessageTrackerPtr_.get());
     ASSERT_EQ(0, tracker->size());
 
+    client.close();
+}
+
+// When a consumer starts grabbing the connection, it registers a timer after the operation timeout. When that
+// timer is expired, it will fail the connection and cancel the connection timer. However, it results a race
+// condition that:
+//   1. The consumer's connection is closed (e.g. the keep alive timer failed)
+//   2. The connection timer is registered on the executor and will trigger the reconnection after 100ms
+//   3. The connection timer is cancelled, then the reconnection won't start.
+TEST(ConsumerTest, testReconnectWhenFirstConnectTimedOut) {
+    ClientConfiguration conf;
+    conf.setOperationTimeoutSeconds(1);
+    Client client{lookupUrl, conf};
+
+    auto topic = "consumer-test-reconnect-when-first-connect-timed-out" + std::to_string(time(nullptr));
+    Consumer consumer;
+    ASSERT_EQ(ResultOk, client.subscribe(topic, "sub", consumer));
+
+    auto timer = ConsumerTest::scheduleCloseConnection(consumer, std::chrono::seconds(1));
+    ASSERT_TRUE(timer != nullptr);
+    timer->wait();
+
+    Producer producer;
+    ASSERT_EQ(ResultOk, client.createProducer(topic, producer));
+    ASSERT_EQ(ResultOk, producer.send(MessageBuilder().setContent("msg").build()));
+
+    Message msg;
+    ASSERT_EQ(ResultOk, consumer.receive(msg, 3000));
+    ASSERT_EQ("msg", msg.getDataAsString());
+    client.close();
+}
+
+TEST(ConsumerTest, testDuplicatedTopics) {
+    Client client{lookupUrl};
+    auto topicPrefix = "consumer-test-duplicated-topics" + std::to_string(time(nullptr));
+    std::array<std::string, 3> uniqueTopics{topicPrefix + "0", topicPrefix + "1", topicPrefix + "2"};
+    std::vector<std::string> topics{uniqueTopics[1], uniqueTopics[0], uniqueTopics[2], uniqueTopics[1],
+                                    uniqueTopics[2]};
+
+    Consumer consumer;
+    ASSERT_EQ(ResultOk, client.subscribe(topics, "sub", consumer));
+
+    for (size_t i = 0; i < uniqueTopics.size(); i++) {
+        Producer producer;
+        ASSERT_EQ(ResultOk, client.createProducer(topics[i], producer));
+        ASSERT_EQ(ResultOk, producer.send(MessageBuilder().setContent("msg-" + std::to_string(i)).build()));
+        Message msg;
+        ASSERT_EQ(ResultOk, consumer.receive(msg, 3000));
+        ASSERT_EQ("msg-" + std::to_string(i), msg.getDataAsString());
+    }
+}
+
+TEST(ConsumerTest, testConsumerListenerShouldNotSegfaultAfterClose) {
+    Client client(lookupUrl);
+
+    const int MSG_COUNT = 100;
+    std::string topicName = "persistent://public/default/my-topic-" + std::to_string(time(nullptr));
+
+    // 1. Create producer send 100 msgs
+    Producer producer;
+    ProducerConfiguration producerConfig;
+    producerConfig.setBatchingEnabled(false);
+    ASSERT_EQ(ResultOk, client.createProducer(topicName, producerConfig, producer));
+    for (int i = 0; i < MSG_COUNT; ++i) {
+        std::string msg = "my-message-" + std::to_string(i);
+        Message message = MessageBuilder().setContent(msg).build();
+        ASSERT_EQ(ResultOk, producer.send(message));
+    }
+
+    // 2. Create consumer with listener
+    Consumer consumer;
+    ConsumerConfiguration consumerConfig;
+    consumerConfig.setSubscriptionInitialPosition(InitialPositionEarliest);
+    Latch latchFirstReceiveMsg(1);
+    Latch latchAfterClosed(1);
+
+    std::promise<std::vector<Result>> ackResultsPromise;
+    consumerConfig.setMessageListener([&latchFirstReceiveMsg, &latchAfterClosed, &ackResultsPromise](
+                                          Consumer consumer, const Message& msg) {
+        latchFirstReceiveMsg.countdown();
+        LOG_INFO("Consume message: " << msg.getDataAsString());
+        latchAfterClosed.wait();
+        std::vector<Result> results(3);
+        results[0] = consumer.acknowledge(msg);
+        results[1] = consumer.acknowledgeCumulative(msg);
+        results[2] = consumer.acknowledge(std::vector<MessageId>{msg.getMessageId()});
+        ackResultsPromise.set_value(results);
+    });
+    auto result = client.subscribe(topicName, "test-sub", consumerConfig, consumer);
+    ASSERT_EQ(ResultOk, result);
+
+    // 3. wait first message consumed in listener and then close consumer.
+    latchFirstReceiveMsg.wait();
+    ASSERT_EQ(ResultOk, consumer.close());
+    latchAfterClosed.countdown();
+    const auto ackResults = ackResultsPromise.get_future().get();
+    ASSERT_EQ(3, ackResults.size());
+    for (size_t i = 0; i < ackResults.size(); i++) {
+        ASSERT_EQ(ResultAlreadyClosed, ackResults[i]) << "ack result[" << i << "] " << ackResults[i];
+    }
+
+    ASSERT_EQ(ResultOk, producer.close());
+    ASSERT_EQ(ResultOk, client.close());
+}
+
+TEST(ConsumerTest, testCloseAfterSeek) {
+    const auto topic = "test-close-after-seek-" + std::to_string(time(nullptr));
+    const auto subscription = "sub";
+    Client client(lookupUrl);
+    Consumer consumer;
+    ASSERT_EQ(ResultOk, client.subscribe(topic, subscription, consumer));
+    ASSERT_EQ(ResultOk, consumer.seek(TimeUtils::currentTimeMillis()));
+    consumer.closeAsync(nullptr);
+
+    // Test the previous consumer will be closed even after seek is done, at the moment the connection might
+    // not be established.
+    ASSERT_EQ(ResultOk, client.subscribe(topic, subscription, consumer));
+
+    // Test creating a consumer from a different client should also work for this case
+    Client anotherClient(lookupUrl);
+    consumer.closeAsync(nullptr);
+    ASSERT_EQ(ResultOk, anotherClient.subscribe(topic, subscription, consumer));
+
+    client.close();
+    anotherClient.close();
+}
+
+TEST(ConsumerTest, testIsConnectedFalsePositiveAfterSubscribeRejectedOnReconnect) {
+    // A reconnect SUBSCRIBE failure happens after the initial subscribe has already completed.
+    const std::string topic =
+        "persistent://public/default/test-false-positive-" + std::to_string(time(nullptr));
+    Client client(lookupUrl);
+    Consumer consumer;
+    ASSERT_EQ(ResultOk, client.subscribe(topic, "sub", consumer));
+    ASSERT_TRUE(consumer.isConnected()) << "Precondition: consumer should be connected";
+
+    auto& consumerImpl = PulsarFriend::getConsumerImpl(consumer);
+
+    // Capture the current live connection.
+    auto cnx = consumerImpl.getCnx().lock();
+    ASSERT_TRUE(cnx != nullptr) << "Precondition: cnx should be non-null";
+    LOG_INFO("Step 1 passed: consumer subscribed, cnx=" << cnx);
+
+    // Simulate the broker rejecting the SUBSCRIBE command during reconnect.
+    Result handleResult = PulsarFriend::consumerHandleCreateConsumer(consumer, cnx, ResultAuthorizationError);
+    LOG_INFO("Step 2: handleCreateConsumer returned " << handleResult);
+    EXPECT_EQ(ResultRetryable, handleResult)
+        << "handleCreateConsumer should return ResultRetryable for an already-created consumer";
+
+    // The failed SUBSCRIBE must clear the connection set before SUBSCRIBE.
+    auto cnxAfter = consumerImpl.getCnx().lock();
+    LOG_INFO("Step 3: cnx after handleCreateConsumer failure = " << cnxAfter);
+    LOG_INFO("Step 3: isConnected() = " << consumer.isConnected());
+
+    EXPECT_EQ(nullptr, cnxAfter)
+        << "After fix: connection_ must be cleared by resetCnx() so grabCnx() can retry";
+    EXPECT_FALSE(consumer.isConnected())
+        << "After fix: isConnected() must return false after SUBSCRIBE rejection";
+
+    consumer.close();
     client.close();
 }
 

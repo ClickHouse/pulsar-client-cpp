@@ -21,13 +21,16 @@
 
 #include <pulsar/Reader.h>
 
-#include <boost/optional.hpp>
-#include <boost/variant.hpp>
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <list>
 #include <memory>
+#include <optional>
+#include <set>
 #include <utility>
+#include <variant>
 
 #include "BrokerConsumerStatsImpl.h"
 #include "Commands.h"
@@ -37,7 +40,6 @@
 #include "MapCache.h"
 #include "MessageIdImpl.h"
 #include "NegativeAcksTracker.h"
-#include "Synchronized.h"
 #include "TestUtil.h"
 #include "TimeUtils.h"
 #include "UnboundedBlockingQueue.h"
@@ -67,7 +69,7 @@ class BrokerEntryMetadata;
 class MessageMetadata;
 }  // namespace proto
 
-enum ConsumerTopicType
+enum ConsumerTopicType : uint8_t
 {
     NonPartitioned,
     Partitioned
@@ -79,29 +81,32 @@ const static std::string DLQ_GROUP_TOPIC_SUFFIX = "-DLQ";
 
 enum class SeekStatus : std::uint8_t
 {
-    NOT_STARTED,
-    IN_PROGRESS,
-    COMPLETED
+    NOT_STARTED,  // there is no pending seek RPC so that it's allowed to seek
+    IN_PROGRESS,  // the seek RPC is in progress
+    COMPLETED     // the seek RPC is done but the connection is not established yet
 };
 
 class ConsumerImpl : public ConsumerImplBase {
    public:
-    ConsumerImpl(const ClientImplPtr client, const std::string& topic, const std::string& subscriptionName,
+    ConsumerImpl(const ClientImplPtr& client, const std::string& topic, const std::string& subscriptionName,
                  const ConsumerConfiguration&, bool isPersistent, const ConsumerInterceptorsPtr& interceptors,
-                 const ExecutorServicePtr listenerExecutor = ExecutorServicePtr(), bool hasParent = false,
+                 const ExecutorServicePtr& listenerExecutor = ExecutorServicePtr(), bool hasParent = false,
                  const ConsumerTopicType consumerTopicType = NonPartitioned,
                  Commands::SubscriptionMode = Commands::SubscriptionModeDurable,
-                 boost::optional<MessageId> startMessageId = boost::none);
+                 const optional<MessageId>& startMessageId = optional<MessageId>());
     ~ConsumerImpl();
     void setPartitionIndex(int partitionIndex);
     int getPartitionIndex();
     void sendFlowPermitsToBroker(const ClientConnectionPtr& cnx, int numMessages);
-    uint64_t getConsumerId();
+    uint64_t getConsumerId() const noexcept { return consumerId_; }
     void messageReceived(const ClientConnectionPtr& cnx, const proto::CommandMessage& msg,
                          bool& isChecksumValid, proto::BrokerEntryMetadata& brokerEntryMetadata,
                          proto::MessageMetadata& msgMetadata, SharedBuffer& payload);
     void messageProcessed(Message& msg, bool track = true);
     void activeConsumerChanged(bool isActive);
+    // The broker signalled that this (terminated) topic has no more messages beyond what has already
+    // been delivered. Surface ResultTopicTerminated to receivers once the prefetch queue drains.
+    void reachedEndOfTopic();
     inline CommandSubscribe_SubType getSubType();
     inline CommandSubscribe_InitialPosition getInitialPosition();
 
@@ -114,15 +119,20 @@ class ConsumerImpl : public ConsumerImplBase {
     const std::string& getTopic() const override;
     Result receive(Message& msg) override;
     Result receive(Message& msg, int timeout) override;
-    void receiveAsync(ReceiveCallback callback) override;
-    void unsubscribeAsync(ResultCallback callback) override;
-    void acknowledgeAsync(const MessageId& msgId, ResultCallback callback) override;
-    void acknowledgeAsync(const MessageIdList& messageIdList, ResultCallback callback) override;
-    void acknowledgeCumulativeAsync(const MessageId& msgId, ResultCallback callback) override;
-    void closeAsync(ResultCallback callback) override;
+    void receiveAsync(const ReceiveCallback& callback) override;
+    void unsubscribeAsync(const ResultCallback& callback) override;
+    void acknowledgeAsync(const MessageId& msgId, const ResultCallback& callback) override;
+    void acknowledgeAsync(const MessageIdList& messageIdList, const ResultCallback& callback) override;
+    void acknowledgeCumulativeAsync(const MessageId& msgId, const ResultCallback& callback) override;
+    void closeAsync(const ResultCallback& callback) override;
     void start() override;
     void shutdown() override;
+    void internalShutdown();
     bool isClosed() override;
+    bool isClosingOrClosed() const noexcept {
+        const auto state = state_.load(std::memory_order_relaxed);
+        return state == Closing || state == Closed;
+    }
     bool isOpen() override;
     Result pauseMessageListener() override;
     Result resumeMessageListener() override;
@@ -130,17 +140,19 @@ class ConsumerImpl : public ConsumerImplBase {
     void redeliverUnacknowledgedMessages(const std::set<MessageId>& messageIds) override;
     const std::string& getName() const override;
     int getNumOfPrefetchedMessages() const override;
-    void getBrokerConsumerStatsAsync(BrokerConsumerStatsCallback callback) override;
-    void getLastMessageIdAsync(BrokerGetLastMessageIdCallback callback) override;
-    void seekAsync(const MessageId& msgId, ResultCallback callback) override;
-    void seekAsync(uint64_t timestamp, ResultCallback callback) override;
+    void getBrokerConsumerStatsAsync(const BrokerConsumerStatsCallback& callback) override;
+    void getLastMessageIdAsync(const BrokerGetLastMessageIdCallback& callback) override;
+    void seekAsync(const MessageId& msgId, const ResultCallback& callback) override;
+    using SeekTimestampType = uint64_t;
+    using SeekArg = std::variant<SeekTimestampType, MessageId>;
+    void seekAsync(SeekTimestampType timestamp, const ResultCallback& callback) override;
     void negativeAcknowledge(const MessageId& msgId) override;
     bool isConnected() const override;
     uint64_t getNumberOfConnectedConsumer() override;
-    void hasMessageAvailableAsync(HasMessageAvailableCallback callback) override;
+    void hasMessageAvailableAsync(const HasMessageAvailableCallback& callback) override;
 
     virtual void disconnectConsumer();
-    virtual void disconnectConsumer(const boost::optional<std::string>& assignedBrokerUrl);
+    virtual void disconnectConsumer(const optional<std::string>& assignedBrokerUrl);
     Result fetchSingleMessageFromBroker(Message& msg);
 
     virtual bool isCumulativeAcknowledgementAllowed(ConsumerType consumerType);
@@ -151,6 +163,11 @@ class ConsumerImpl : public ConsumerImplBase {
     void beforeConnectionChange(ClientConnection& cnx) override;
     void onNegativeAcksSend(const std::set<MessageId>& messageIds);
 
+    void doImmediateAck(const MessageId& msgId, const ResultCallback& callback, CommandAck_AckType ackType);
+    void doImmediateAck(const std::set<MessageId>& msgIds, const ResultCallback& callback);
+
+    void onClusterSwitching();
+
     // Validates the layout of a chunked message declared by its first chunk before anything is allocated for
     // it. The values come from the metadata written by the producer. Every chunk carries at least one byte
     // and at most one message, so both the number of chunks and the total size are bounded by each other.
@@ -159,7 +176,7 @@ class ConsumerImpl : public ConsumerImplBase {
 
    protected:
     // overrided methods from HandlerBase
-    Future<Result, bool> connectionOpened(const ClientConnectionPtr& cnx) override;
+    Future<Error, bool> connectionOpened(const ClientConnectionPtr& cnx) override;
     void connectionFailed(Result result) override;
 
     // impl methods from ConsumerImpl base
@@ -183,23 +200,37 @@ class ConsumerImpl : public ConsumerImplBase {
     static constexpr uint32_t MaxUncompressedMessageSize = 256 * 1024 * 1024;
 
     std::atomic_bool waitingForZeroQueueSizeMessage;
+    // Set when the broker sends CommandReachedEndOfTopic and cleared again on each new broker
+    // session (termination does not cancel redelivery of unacked messages); a drained receive
+    // then yields ResultTopicTerminated instead of parking forever.
+    std::atomic_bool hasReachedEndOfTopic_{false};
     std::shared_ptr<ConsumerImpl> get_shared_this_ptr();
     bool uncompressMessageIfNeeded(const ClientConnectionPtr& cnx, const proto::MessageIdData& messageIdData,
                                    const proto::MessageMetadata& metadata, SharedBuffer& payload,
                                    bool checkMaxMessageSize);
     void discardCorruptedMessage(const ClientConnectionPtr& cnx, const proto::MessageIdData& messageId,
-                                 CommandAck_ValidationError validationError);
+                                 CommandAck_ValidationError validationError,
+                                 bool increasePermits = true);
     void increaseAvailablePermits(const ClientConnectionPtr& currentCnx, int delta = 1);
     void increaseAvailablePermits(const Message& msg);
     void drainIncomingMessageQueue(size_t count);
     uint32_t receiveIndividualMessagesFromBatch(const ClientConnectionPtr& cnx, Message& batchedMessage,
                                                 const BitSet& ackSet, int redeliveryCount);
-    bool isPriorBatchIndex(int32_t idx);
-    bool isPriorEntryIndex(int64_t idx);
-    void brokerConsumerStatsListener(Result, BrokerConsumerStatsImpl, BrokerConsumerStatsCallback);
+    template <typename T>
+    bool isPrior(T index, T startIndex) const noexcept {
+        return config_.isStartMessageIdInclusive() ? (index < startIndex) : (index <= startIndex);
+    }
+    void brokerConsumerStatsListener(Result, BrokerConsumerStatsImpl, const BrokerConsumerStatsCallback&);
 
-    bool decryptMessageIfNeeded(const ClientConnectionPtr& cnx, const proto::CommandMessage& msg,
-                                const proto::MessageMetadata& metadata, SharedBuffer& payload);
+    enum class DecryptionResult : uint8_t
+    {
+        SUCCESS,
+        CONSUME_ENCRYPTED,
+        FAILED
+    };
+    DecryptionResult decryptMessageIfNeeded(const ClientConnectionPtr& cnx, const proto::CommandMessage& msg,
+                                            const optional<EncryptionContext>& context,
+                                            SharedBuffer& payload);
 
     // TODO - Convert these functions to lambda when we move to C++11
     Result receiveHelper(Message& msg);
@@ -211,23 +242,13 @@ class ConsumerImpl : public ConsumerImplBase {
     void trackMessage(const MessageId& messageId);
     void internalGetLastMessageIdAsync(const BackoffPtr& backoff, TimeDuration remainTime,
                                        const DeadlineTimerPtr& timer,
-                                       BrokerGetLastMessageIdCallback callback);
+                                       const BrokerGetLastMessageIdCallback& callback);
 
     void clearReceiveQueue();
-    using SeekArg = boost::variant<uint64_t, MessageId>;
-    friend std::ostream& operator<<(std::ostream& os, const SeekArg& seekArg) {
-        auto ptr = boost::get<uint64_t>(&seekArg);
-        if (ptr) {
-            os << *ptr;
-        } else {
-            os << *boost::get<MessageId>(&seekArg);
-        }
-        return os;
-    }
 
-    void seekAsyncInternal(long requestId, SharedBuffer seek, const SeekArg& seekArg,
-                           ResultCallback callback);
-    void processPossibleToDLQ(const MessageId& messageId, ProcessDLQCallBack cb);
+    void seekAsyncInternal(long requestId, const SharedBuffer& seek, const SeekArg& seekArg,
+                           ResultCallback&& callback);
+    void processPossibleToDLQ(const MessageId& messageId, const ProcessDLQCallBack& cb);
 
     std::mutex mutexForReceiveWithZeroQueueSize;
     const ConsumerConfiguration config_;
@@ -247,7 +268,7 @@ class ConsumerImpl : public ConsumerImplBase {
     std::queue<ReceiveCallback> pendingReceives_;
     std::atomic_int availablePermits_;
     const int receiverQueueRefillThreshold_;
-    uint64_t consumerId_;
+    const uint64_t consumerId_;
     const std::string consumerStr_;
     int32_t partitionIndex_ = -1;
     Promise<Result, ConsumerImplBaseWeakPtr> consumerCreatedPromise_;
@@ -256,7 +277,7 @@ class ConsumerImpl : public ConsumerImplBase {
     UnAckedMessageTrackerPtr unAckedMessageTrackerPtr_;
     BrokerConsumerStatsImpl brokerConsumerStats_;
     std::shared_ptr<NegativeAcksTracker> negativeAcksTracker_;
-    AckGroupingTrackerPtr ackGroupingTrackerPtr_;
+    const AckGroupingTrackerPtr ackGroupingTrackerPtr_;
 
     MessageCryptoPtr msgCrypto_;
     const bool readCompacted_;
@@ -265,18 +286,18 @@ class ConsumerImpl : public ConsumerImplBase {
     std::shared_ptr<Promise<Result, Producer>> deadLetterProducer_;
     std::mutex createProducerLock_;
 
-    // Make the access to `lastDequedMessageId_` and `lastMessageIdInBroker_` thread safe
-    mutable std::mutex mutexForMessageId_;
     MessageId lastDequedMessageId_{MessageId::earliest()};
     MessageId lastMessageIdInBroker_{MessageId::earliest()};
 
-    std::atomic<SeekStatus> seekStatus_{SeekStatus::NOT_STARTED};
-    Synchronized<ResultCallback> seekCallback_{[](Result) {}};
-    Synchronized<boost::optional<MessageId>> startMessageId_;
-    Synchronized<MessageId> seekMessageId_{MessageId::earliest()};
-    std::atomic<bool> hasSoughtByTimestamp_{false};
+    // When the consumer switches to a new cluster, we should reset `startMessageId_` to the original value,
+    // otherwise, the message id of the old cluster might be passed in the Subscribe request on the new
+    // cluster.
+    const optional<MessageId> startMessageIdFromConfig_;
+    optional<MessageId> startMessageId_;
 
-    bool duringSeek() const { return seekStatus_ != SeekStatus::NOT_STARTED; }
+    SeekStatus seekStatus_{SeekStatus::NOT_STARTED};
+    optional<ResultCallback> seekCallback_;
+    optional<SeekArg> lastSeekArg_;
 
     class ChunkedMessageCtx {
        public:
@@ -291,9 +312,9 @@ class ConsumerImpl : public ConsumerImplBase {
         ChunkedMessageCtx(const ChunkedMessageCtx&) = delete;
         // Here we don't use =default to be compatible with GCC 4.8
         ChunkedMessageCtx(ChunkedMessageCtx&& rhs) noexcept
-            : totalChunks_(rhs.totalChunks_),
-              chunkedMsgBuffer_(std::move(rhs.chunkedMsgBuffer_)),
-              chunkedMessageIds_(std::move(rhs.chunkedMessageIds_)) {}
+            : totalChunks_(rhs.totalChunks_), chunkedMsgBuffer_(std::move(rhs.chunkedMsgBuffer_)) {
+            std::swap(chunkedMessageIds_, rhs.chunkedMessageIds_);
+        }
 
         bool validateChunkId(int chunkId) const noexcept { return chunkId == numChunks(); }
 
@@ -309,7 +330,11 @@ class ConsumerImpl : public ConsumerImplBase {
 
         const std::vector<MessageId>& getChunkedMessageIds() const noexcept { return chunkedMessageIds_; }
 
-        std::vector<MessageId> moveChunkedMessageIds() noexcept { return std::move(chunkedMessageIds_); }
+        std::vector<MessageId> moveChunkedMessageIds() noexcept {
+            std::vector<MessageId> result;
+            result.swap(chunkedMessageIds_);
+            return result;
+        }
 
         long getReceivedTimeMs() const noexcept { return receivedTimeMs_; }
 
@@ -358,9 +383,12 @@ class ConsumerImpl : public ConsumerImplBase {
     std::atomic_bool expireChunkMessageTaskScheduled_{false};
 
     ConsumerInterceptorsPtr interceptors_;
+    const std::shared_ptr<std::atomic<uint64_t>> requestIdGenerator_;
+
+    uint64_t newRequestId() const { return (*requestIdGenerator_)++; }
 
     void triggerCheckExpiredChunkedTimer();
-    void discardChunkMessages(std::string uuid, MessageId messageId, bool autoAck);
+    void discardChunkMessages(const std::string& uuid, const MessageId& messageId, bool autoAck);
 
     /**
      * Process a chunk. If the chunk is the last chunk of a message, concatenate all buffered chunks into the
@@ -375,13 +403,14 @@ class ConsumerImpl : public ConsumerImplBase {
      * @return the concatenated payload if chunks are concatenated into a completed message payload
      *   successfully, else Optional::empty()
      */
-    boost::optional<SharedBuffer> processMessageChunk(const SharedBuffer& payload,
-                                                      const proto::MessageMetadata& metadata,
-                                                      const proto::MessageIdData& messageIdData,
-                                                      const ClientConnectionPtr& cnx, MessageId& messageId);
+    optional<SharedBuffer> processMessageChunk(const SharedBuffer& payload,
+                                               const proto::MessageMetadata& metadata,
+                                               const proto::MessageIdData& messageIdData,
+                                               const ClientConnectionPtr& cnx, MessageId& messageId);
 
     bool hasMoreMessages() const {
-        std::lock_guard<std::mutex> lock{mutexForMessageId_};
+        LockGuard lock{mutex_};
+
         if (lastMessageIdInBroker_.entryId() == -1L) {
             return false;
         }
@@ -389,13 +418,29 @@ class ConsumerImpl : public ConsumerImplBase {
         const auto inclusive = config_.isStartMessageIdInclusive();
         if (lastDequedMessageId_ == MessageId::earliest()) {
             // If startMessageId_ is none, use latest so that this method will return false
-            const auto startMessageId = startMessageId_.get().value_or(MessageId::latest());
+            const auto startMessageId = startMessageId_.value_or(MessageId::latest());
             return inclusive ? (lastMessageIdInBroker_ >= startMessageId)
                              : (lastMessageIdInBroker_ > startMessageId);
         } else {
             return lastMessageIdInBroker_ > lastDequedMessageId_;
         }
     }
+
+    auto getStartMessageId() const {
+        LockGuard lock{mutex_};
+        return startMessageId_;
+    }
+    auto setLastDequedMessageId(const MessageId& messageId) {
+        LockGuard lock{mutex_};
+        lastDequedMessageId_ = messageId;
+    }
+
+    void doImmediateAck(const ClientConnectionPtr& cnx, const MessageId& msgId, CommandAck_AckType ackType,
+                        const ResultCallback& callback);
+    void doImmediateAck(const ClientConnectionPtr& cnx, const std::set<MessageId>& msgIds,
+                        const ResultCallback& callback);
+
+    using LockGuard = std::lock_guard<std::mutex>;
 
     friend class PulsarFriend;
     friend class MultiTopicsConsumerImpl;

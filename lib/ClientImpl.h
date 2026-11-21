@@ -20,16 +20,22 @@
 #define LIB_CLIENTIMPL_H_
 
 #include <pulsar/Client.h>
+#include <pulsar/ServiceInfo.h>
+#include <pulsar/ServiceInfoProvider.h>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 
+#include "AtomicSharedPtr.h"
 #include "ConnectionPool.h"
 #include "Future.h"
 #include "LookupDataResult.h"
+#include "LookupService.h"
 #include "MemoryLimitController.h"
 #include "ProtoApiEnums.h"
-#include "ServiceNameResolver.h"
 #include "SynchronizedHashMap.h"
 
 namespace pulsar {
@@ -52,8 +58,8 @@ typedef std::weak_ptr<ConsumerImplBase> ConsumerImplBaseWeakPtr;
 class ClientConnection;
 using ClientConnectionPtr = std::shared_ptr<ClientConnection>;
 
-class LookupService;
-using LookupServicePtr = std::shared_ptr<LookupService>;
+using LookupServiceFactory = std::function<LookupServicePtr(
+    ServiceInfo&& serviceInfo, const ClientConfiguration&, ConnectionPool& pool)>;
 
 class ProducerImplBase;
 using ProducerImplBaseWeakPtr = std::weak_ptr<ProducerImplBase>;
@@ -69,32 +75,67 @@ std::string generateRandomName();
 
 class ClientImpl : public std::enable_shared_from_this<ClientImpl> {
    public:
+    ClientImpl(std::unique_ptr<ServiceInfoProvider> serviceInfoProvider,
+               const ClientConfiguration& clientConfiguration);
+    ClientImpl(std::unique_ptr<ServiceInfoProvider> serviceInfoProvider,
+               const ClientConfiguration& clientConfiguration, LookupServiceFactory&& lookupServiceFactory);
     ClientImpl(const std::string& serviceUrl, const ClientConfiguration& clientConfiguration);
+
+    // only for tests
+    ClientImpl(const std::string& serviceUrl, const ClientConfiguration& clientConfiguration,
+               LookupServiceFactory&& lookupServiceFactory);
+
+    void initialize();
     virtual ~ClientImpl();
 
     /**
      * @param autoDownloadSchema When it is true, Before creating a producer, it will try to get the schema
      * that exists for the topic.
      */
-    void createProducerAsync(const std::string& topic, ProducerConfiguration conf,
-                             CreateProducerCallback callback, bool autoDownloadSchema = false);
+    void createProducerAsync(const std::string& topic, const ProducerConfiguration& conf,
+                             CreateProducerV2Callback callback, bool autoDownloadSchema = false);
+
+    /**
+     * Scalable topics (pulsar::st): create a producer on a segment:// backing
+     * topic, bypassing the segment-domain rejection applied to the public path.
+     */
+    void createSegmentProducerAsync(const std::string& topic, const ProducerConfiguration& conf,
+                                    CreateProducerV2Callback callback,
+                                    const std::optional<std::string>& assignedBrokerUrl = std::nullopt);
+
+    /**
+     * Subscribe a consumer to a single `segment://` scalable-topic segment, bypassing the
+     * segment-domain rejection applied to the public subscribe path. The scalable-topics
+     * queue/stream consumers use this to attach a per-segment consumer.
+     */
+    void subscribeSegmentAsync(const std::string& topic, const std::string& subscriptionName,
+                               const ConsumerConfiguration& conf, SubscribeV2Callback callback);
 
     void subscribeAsync(const std::string& topic, const std::string& subscriptionName,
-                        const ConsumerConfiguration& conf, SubscribeCallback callback);
+                        const ConsumerConfiguration& conf, const SubscribeCallback& callback);
+
+    void subscribeAsyncV2(const SubscribeTopics& topics, const std::string& subscriptionName,
+                          const ConsumerConfiguration& conf, SubscribeV2Callback callback);
 
     void subscribeAsync(const std::vector<std::string>& topics, const std::string& subscriptionName,
-                        const ConsumerConfiguration& conf, SubscribeCallback callback);
+                        const ConsumerConfiguration& conf, const SubscribeCallback& callback);
 
     void subscribeWithRegexAsync(const std::string& regexPattern, const std::string& subscriptionName,
-                                 const ConsumerConfiguration& conf, SubscribeCallback callback);
+                                 const ConsumerConfiguration& conf, const SubscribeCallback& callback);
 
     void createReaderAsync(const std::string& topic, const MessageId& startMessageId,
-                           const ReaderConfiguration& conf, ReaderCallback callback);
+                           const ReaderConfiguration& conf, const ReaderCallback& callback);
+
+    void createReaderAsyncV2(const std::string& topic, const MessageId& startMessageId,
+                             const ReaderConfiguration& conf, ReaderV2Callback callback);
 
     void createTableViewAsync(const std::string& topic, const TableViewConfiguration& conf,
-                              TableViewCallback callback);
+                              const TableViewCallback& callback);
 
-    void getPartitionsForTopicAsync(const std::string& topic, GetPartitionsCallback callback);
+    void createTableViewAsyncV2(const std::string& topic, const TableViewConfiguration& conf,
+                                TableViewV2Callback callback);
+
+    void getPartitionsForTopicAsync(const std::string& topic, const GetPartitionsCallback& callback);
 
     // Use virtual method to test
     virtual GetConnectionFuture getConnection(const std::string& redirectedClusterURI,
@@ -103,7 +144,7 @@ class ClientImpl : public std::enable_shared_from_this<ClientImpl> {
     GetConnectionFuture connect(const std::string& redirectedClusterURI, const std::string& logicalAddress,
                                 size_t key);
 
-    void closeAsync(CloseCallback callback);
+    void closeAsync(const CloseCallback& callback);
     void shutdown();
 
     MemoryLimitController& getMemoryLimitController();
@@ -121,7 +162,6 @@ class ClientImpl : public std::enable_shared_from_this<ClientImpl> {
     ExecutorServiceProviderPtr getIOExecutorProvider();
     ExecutorServiceProviderPtr getListenerExecutorProvider();
     ExecutorServiceProviderPtr getPartitionListenerExecutorProvider();
-    LookupServicePtr getLookup(const std::string& redirectedClusterURI = "");
 
     void cleanupProducer(ProducerImplBase* address) { producers_.remove(address); }
 
@@ -132,59 +172,106 @@ class ClientImpl : public std::enable_shared_from_this<ClientImpl> {
     ConnectionPool& getConnectionPool() noexcept { return pool_; }
     uint64_t getLookupCount() { return lookupCount_; }
 
+    void updateServiceInfo(ServiceInfo&& serviceInfo);
+    ServiceInfo getServiceInfo() const;
+
+    // Since the underlying `lookupServicePtr_` can be modified by `updateServiceInfo`, we should not expose
+    // it to other classes, otherwise the update might not be visible.
+    auto getPartitionMetadataAsync(const TopicNamePtr& topicName) {
+        std::shared_lock lock(mutex_);
+        return lookupServicePtr_->getPartitionMetadataAsync(topicName);
+    }
+
+    auto getTopicsOfNamespaceAsync(const NamespaceNamePtr& nsName, CommandGetTopicsOfNamespace_Mode mode) {
+        std::shared_lock lock(mutex_);
+        return lookupServicePtr_->getTopicsOfNamespaceAsync(nsName, mode);
+    }
+    auto getSchema(const TopicNamePtr& topicName, const std::string& version = "") {
+        std::shared_lock lock(mutex_);
+        return lookupServicePtr_->getSchema(topicName, version);
+    }
+
     static std::chrono::nanoseconds getOperationTimeout(const ClientConfiguration& clientConfiguration);
 
     friend class PulsarFriend;
 
    private:
-    void handleCreateProducer(const Result result, const LookupDataResultPtr partitionMetadata,
-                              TopicNamePtr topicName, ProducerConfiguration conf,
-                              CreateProducerCallback callback);
+    void createProducerAsyncImpl(const std::string& topic, const ProducerConfiguration& conf,
+                                 CreateProducerV2Callback callback, bool autoDownloadSchema,
+                                 bool allowSegmentTopic,
+                                 const std::optional<std::string>& assignedBrokerUrl = std::nullopt);
 
-    void handleSubscribe(const Result result, const LookupDataResultPtr partitionMetadata,
-                         TopicNamePtr topicName, const std::string& consumerName, ConsumerConfiguration conf,
-                         SubscribeCallback callback);
+    void handleCreateProducer(const Error& error, const LookupDataResultPtr& partitionMetadata,
+                              const TopicNamePtr& topicName, const ProducerConfiguration& conf,
+                              CreateProducerV2Callback callback,
+                              const std::optional<std::string>& assignedBrokerUrl = std::nullopt);
 
-    void handleReaderMetadataLookup(const Result result, const LookupDataResultPtr partitionMetadata,
-                                    TopicNamePtr topicName, MessageId startMessageId,
-                                    ReaderConfiguration conf, ReaderCallback callback);
+    void handleSubscribe(const Error& error, const LookupDataResultPtr& partitionMetadata,
+                         const TopicNamePtr& topicName, const std::string& consumerName,
+                         ConsumerConfiguration conf, SubscribeV2Callback callback);
 
-    void handleGetPartitions(const Result result, const LookupDataResultPtr partitionMetadata,
-                             TopicNamePtr topicName, GetPartitionsCallback callback);
+    void subscribeToTopicsAsyncV2(const std::string& topic, const std::string& subscriptionName,
+                                  const ConsumerConfiguration& conf, SubscribeV2Callback callback,
+                                  bool allowSegmentTopic = false);
 
-    void handleProducerCreated(Result result, ProducerImplBaseWeakPtr producerWeakPtr,
-                               CreateProducerCallback callback, ProducerImplBasePtr producer);
-    void handleConsumerCreated(Result result, ConsumerImplBaseWeakPtr consumerWeakPtr,
-                               SubscribeCallback callback, ConsumerImplBasePtr consumer);
+    void subscribeToTopicsAsyncV2(const std::vector<std::string>& topics, const std::string& subscriptionName,
+                                  const ConsumerConfiguration& conf, SubscribeV2Callback callback);
+
+    void subscribeToTopicsAsyncV2(const TopicRegex& topicRegex, const std::string& subscriptionName,
+                                  const ConsumerConfiguration& conf, SubscribeV2Callback callback);
+
+    void handleReaderMetadataLookup(const Error& error, const LookupDataResultPtr& partitionMetadata,
+                                    const TopicNamePtr& topicName, const MessageId& startMessageId,
+                                    const ReaderConfiguration& conf, const ReaderV2Callback& callback);
+
+    void handleGetPartitions(Result result, const LookupDataResultPtr& partitionMetadata,
+                             const TopicNamePtr& topicName, const GetPartitionsCallback& callback);
+
+    void handleProducerCreated(const Error& error, const ProducerImplBaseWeakPtr& producerWeakPtr,
+                               const CreateProducerV2Callback& callback, const ProducerImplBasePtr& producer);
+    void handleConsumerCreated(Result result, const ConsumerImplBaseWeakPtr& consumerWeakPtr,
+                               const SubscribeV2Callback& callback, const ConsumerImplBasePtr& consumer);
 
     typedef std::shared_ptr<std::atomic<int>> SharedInt;
 
-    void handleClose(Result result, SharedInt remaining, ResultCallback callback);
+    void handleClose(Result result, const SharedInt& remaining, const ResultCallback& callback);
 
-    void createPatternMultiTopicsConsumer(const Result result, const NamespaceTopicsPtr topics,
+    void createPatternMultiTopicsConsumer(Result result, const NamespaceTopicsPtr& topics,
                                           const std::string& regexPattern,
                                           CommandGetTopicsOfNamespace_Mode mode,
                                           const std::string& consumerName, const ConsumerConfiguration& conf,
-                                          SubscribeCallback callback);
+                                          SubscribeV2Callback callback);
 
     const std::string& getPhysicalAddress(const std::string& redirectedClusterURI,
                                           const std::string& logicalAddress);
 
-    LookupServicePtr createLookup(const std::string& serviceUrl);
+    // This overload is only used for blue-green migration, where only the service URL is modified, the other
+    // parameters remain the same
+    LookupServicePtr createRedirectedLookup(const std::string& redirectedUrl) {
+        auto serviceInfo = serviceInfo_.load();
+        return createLookup(
+            ServiceInfo{redirectedUrl, serviceInfo->authentication(), serviceInfo->tlsTrustCertsFilePath()});
+    }
+
+    LookupServicePtr createLookup(ServiceInfo serviceInfo);
+
+    LookupServicePtr getLookup(const std::string& redirectedClusterURI);
 
     static std::string getClientVersion(const ClientConfiguration& clientConfiguration);
 
-    enum State
+    enum State : uint8_t
     {
         Open,
         Closing,
         Closed
     };
 
-    std::mutex mutex_;
+    std::unique_ptr<ServiceInfoProvider> serviceInfoProvider_;
+    mutable std::shared_mutex mutex_;
 
     State state_;
     ClientConfiguration clientConfiguration_;
+    AtomicSharedPtr<ServiceInfo> serviceInfo_;
     MemoryLimitController memoryLimitController_;
 
     ExecutorServiceProviderPtr ioExecutorProvider_;
@@ -195,8 +282,8 @@ class ClientImpl : public std::enable_shared_from_this<ClientImpl> {
     std::unordered_map<std::string, LookupServicePtr> redirectedClusterLookupServicePtrs_;
     ConnectionPool pool_;
 
-    uint64_t producerIdGenerator_;
-    uint64_t consumerIdGenerator_;
+    std::atomic_uint64_t producerIdGenerator_;
+    std::atomic_uint64_t consumerIdGenerator_;
     std::shared_ptr<std::atomic<uint64_t>> requestIdGenerator_{std::make_shared<std::atomic<uint64_t>>(0)};
 
     SynchronizedHashMap<ProducerImplBase*, ProducerImplBaseWeakPtr> producers_;
@@ -205,6 +292,7 @@ class ClientImpl : public std::enable_shared_from_this<ClientImpl> {
     std::atomic<Result> closingError;
     std::atomic<bool> useProxy_;
     std::atomic<uint64_t> lookupCount_;
+    LookupServiceFactory lookupServiceFactory_;
 
     friend class Client;
 };

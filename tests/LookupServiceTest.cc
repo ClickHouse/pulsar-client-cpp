@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 #include <pulsar/Authentication.h>
 #include <pulsar/Client.h>
+#include <pulsar/ServiceInfo.h>
 
 #include <algorithm>
 #include <boost/exception/all.hpp>
@@ -30,6 +31,7 @@
 #include "HttpHelper.h"
 #include "PulsarFriend.h"
 #include "PulsarWrapper.h"
+#include "lib/AtomicSharedPtr.h"
 #include "lib/BinaryProtoLookupService.h"
 #include "lib/ClientConnection.h"
 #include "lib/ConnectionPool.h"
@@ -79,25 +81,26 @@ using namespace pulsar;
 
 TEST(LookupServiceTest, basicLookup) {
     ExecutorServiceProviderPtr service = std::make_shared<ExecutorServiceProvider>(1);
-    AuthenticationPtr authData = AuthFactory::Disabled();
     std::string url = "pulsar://localhost:6650";
     ClientConfiguration conf;
     ExecutorServiceProviderPtr ioExecutorProvider_(std::make_shared<ExecutorServiceProvider>(1));
-    ConnectionPool pool_(conf, ioExecutorProvider_, authData, "");
+    AtomicSharedPtr<ServiceInfo> serviceInfo;
+    serviceInfo.store(std::make_shared<const ServiceInfo>(url));
+    ConnectionPool pool_(serviceInfo, conf, ioExecutorProvider_, "");
     BinaryProtoLookupService lookupService(url, pool_, conf);
 
     TopicNamePtr topicName = TopicName::get("topic");
 
-    Future<Result, LookupDataResultPtr> partitionFuture = lookupService.getPartitionMetadataAsync(topicName);
+    Future<Error, LookupDataResultPtr> partitionFuture = lookupService.getPartitionMetadataAsync(topicName);
     LookupDataResultPtr lookupData;
-    Result result = partitionFuture.get(lookupData);
+    partitionFuture.get(lookupData);
     ASSERT_TRUE(lookupData != NULL);
     ASSERT_EQ(0, lookupData->getPartitions());
 
     const auto topicNamePtr = TopicName::get("topic");
     auto future = lookupService.getBroker(*topicNamePtr);
     LookupService::LookupResult lookupResult;
-    result = future.get(lookupResult);
+    auto result = future.get(lookupResult);
 
     ASSERT_EQ(ResultOk, result);
     ASSERT_EQ(url, lookupResult.logicalAddress);
@@ -126,9 +129,9 @@ static void testMultiAddresses(LookupService& lookupService) {
     results.clear();
     for (int i = 0; i < numRequests; i++) {
         LookupDataResultPtr data;
-        const auto result = lookupService.getPartitionMetadataAsync(TopicName::get("topic")).get(data);
-        LOG_INFO("getPartitionMetadataAsync [" << i << "] " << result);
-        results.emplace_back(result);
+        const auto error = lookupService.getPartitionMetadataAsync(TopicName::get("topic")).get(data);
+        LOG_INFO("getPartitionMetadataAsync [" << i << "] " << error.result);
+        results.emplace_back(error.result);
     }
     verifySuccessCount();
 
@@ -146,24 +149,30 @@ static void testMultiAddresses(LookupService& lookupService) {
 }
 
 TEST(LookupServiceTest, testMultiAddresses) {
-    ConnectionPool pool({}, std::make_shared<ExecutorServiceProvider>(1), AuthFactory::Disabled(), "");
+    AtomicSharedPtr<ServiceInfo> serviceInfo;
+    serviceInfo.store(std::make_shared<const ServiceInfo>(binaryLookupUrl));
+    ConnectionPool pool(serviceInfo, {}, std::make_shared<ExecutorServiceProvider>(1), "");
     ClientConfiguration conf;
-    BinaryProtoLookupService binaryLookupService("pulsar://localhost,localhost:9999", pool, conf);
+    BinaryProtoLookupService binaryLookupService(ServiceInfo{"pulsar://localhost,localhost:9999"}, pool,
+                                                 conf);
     testMultiAddresses(binaryLookupService);
 
     // HTTPLookupService calls shared_from_this() internally, we must create a shared pointer to test
     auto httpLookupServicePtr = std::make_shared<HTTPLookupService>(
-        "http://localhost,localhost:9999", ClientConfiguration{}, AuthFactory::Disabled());
+        ServiceInfo{"http://localhost,localhost:9999"}, ClientConfiguration{});
     testMultiAddresses(*httpLookupServicePtr);
 }
 TEST(LookupServiceTest, testRetry) {
     auto executorProvider = std::make_shared<ExecutorServiceProvider>(1);
-    ConnectionPool pool({}, executorProvider, AuthFactory::Disabled(), "");
+    AtomicSharedPtr<ServiceInfo> serviceInfo;
+    serviceInfo.store(std::make_shared<const ServiceInfo>(binaryLookupUrl));
+    ConnectionPool pool(serviceInfo, {}, executorProvider, "");
     ClientConfiguration conf;
 
-    auto lookupService = RetryableLookupService::create(
-        std::make_shared<BinaryProtoLookupService>("pulsar://localhost:9999,localhost", pool, conf),
-        std::chrono::seconds(30), executorProvider);
+    auto lookupService =
+        RetryableLookupService::create(std::make_shared<BinaryProtoLookupService>(
+                                           ServiceInfo{"pulsar://localhost:9999,localhost"}, pool, conf),
+                                       std::chrono::seconds(30), executorProvider);
     ServiceNameResolver& serviceNameResolver = lookupService->getServiceNameResolver();
 
     PulsarFriend::setServiceUrlIndex(serviceNameResolver, 0);
@@ -177,7 +186,7 @@ TEST(LookupServiceTest, testRetry) {
     PulsarFriend::setServiceUrlIndex(serviceNameResolver, 0);
     auto future2 = lookupService->getPartitionMetadataAsync(topicNamePtr);
     LookupDataResultPtr lookupDataResultPtr;
-    ASSERT_EQ(ResultOk, future2.get(lookupDataResultPtr));
+    ASSERT_EQ(ResultOk, future2.get(lookupDataResultPtr).result);
     LOG_INFO("getPartitionMetadataAsync returns " << lookupDataResultPtr->getPartitions() << " partitions");
 
     PulsarFriend::setServiceUrlIndex(serviceNameResolver, 0);
@@ -192,13 +201,17 @@ TEST(LookupServiceTest, testRetry) {
 
 TEST(LookupServiceTest, testTimeout) {
     auto executorProvider = std::make_shared<ExecutorServiceProvider>(1);
-    ConnectionPool pool({}, executorProvider, AuthFactory::Disabled(), "");
+    AtomicSharedPtr<ServiceInfo> serviceInfo;
+    serviceInfo.store(std::make_shared<const ServiceInfo>(binaryLookupUrl));
+    ConnectionPool pool(serviceInfo, {}, executorProvider, "");
     ClientConfiguration conf;
 
     constexpr int timeoutInSeconds = 2;
     auto lookupService = RetryableLookupService::create(
-        std::make_shared<BinaryProtoLookupService>("pulsar://localhost:9990,localhost:9902,localhost:9904",
-                                                   pool, conf),
+        std::make_shared<BinaryProtoLookupService>(
+            ServiceInfo{"pulsar://localhost:9990,localhost:9902,localhost:9904", AuthFactory::Disabled(),
+                        std::nullopt},
+            pool, conf),
         std::chrono::seconds(timeoutInSeconds), executorProvider);
     auto topicNamePtr = TopicName::get("lookup-service-test-retry");
 
@@ -221,7 +234,7 @@ TEST(LookupServiceTest, testTimeout) {
     beforeMethod();
     auto future2 = lookupService->getPartitionMetadataAsync(topicNamePtr);
     LookupDataResultPtr lookupDataResultPtr;
-    ASSERT_EQ(ResultTimeout, future2.get(lookupDataResultPtr));
+    ASSERT_EQ(ResultTimeout, future2.get(lookupDataResultPtr).result);
     afterMethod("getPartitionMetadataAsync");
 
     beforeMethod();
@@ -259,7 +272,7 @@ TEST_P(LookupServiceTest, basicGetNamespaceTopics) {
     ASSERT_EQ(ResultOk, result);
 
     // 2. verify getTopicsOfNamespace by regex mode.
-    auto lookupServicePtr = PulsarFriend::getClientImplPtr(client_)->getLookup();
+    auto lookupServicePtr = PulsarFriend::getClientImplPtr(client_);
     auto verifyGetTopics = [&](CommandGetTopicsOfNamespace_Mode mode,
                                const std::set<std::string>& expectedTopics) {
         Future<Result, NamespaceTopicsPtr> getTopicsFuture =
@@ -292,12 +305,9 @@ TEST_P(LookupServiceTest, testGetSchema) {
     Producer producer;
     ASSERT_EQ(ResultOk, client_.createProducer(topic, producerConfiguration, producer));
 
-    auto clientImplPtr = PulsarFriend::getClientImplPtr(client_);
-    auto lookup = clientImplPtr->getLookup();
-
     SchemaInfo schemaInfo;
-    auto future = lookup->getSchema(TopicName::get(topic));
-    ASSERT_EQ(ResultOk, future.get(schemaInfo));
+    auto future = PulsarFriend::getClientImplPtr(client_)->getSchema(TopicName::get(topic));
+    ASSERT_EQ(ResultOk, future.get(schemaInfo).result);
     ASSERT_EQ(jsonSchema, schemaInfo.getSchema());
     ASSERT_EQ(SchemaType::JSON, schemaInfo.getSchemaType());
     ASSERT_EQ(properties, schemaInfo.getProperties());
@@ -310,12 +320,9 @@ TEST_P(LookupServiceTest, testGetSchemaNotFound) {
     Producer producer;
     ASSERT_EQ(ResultOk, client_.createProducer(topic, producer));
 
-    auto clientImplPtr = PulsarFriend::getClientImplPtr(client_);
-    auto lookup = clientImplPtr->getLookup();
-
     SchemaInfo schemaInfo;
-    auto future = lookup->getSchema(TopicName::get(topic));
-    ASSERT_EQ(ResultTopicNotFound, future.get(schemaInfo));
+    auto future = PulsarFriend::getClientImplPtr(client_)->getSchema(TopicName::get(topic));
+    ASSERT_EQ(ResultTopicNotFound, future.get(schemaInfo).result);
 }
 
 TEST_P(LookupServiceTest, testGetKeyValueSchema) {
@@ -335,12 +342,9 @@ TEST_P(LookupServiceTest, testGetKeyValueSchema) {
     Producer producer;
     ASSERT_EQ(ResultOk, client_.createProducer(topic, producerConfiguration, producer));
 
-    auto clientImplPtr = PulsarFriend::getClientImplPtr(client_);
-    auto lookup = clientImplPtr->getLookup();
-
     SchemaInfo schemaInfo;
-    auto future = lookup->getSchema(TopicName::get(topic));
-    ASSERT_EQ(ResultOk, future.get(schemaInfo));
+    auto future = PulsarFriend::getClientImplPtr(client_)->getSchema(TopicName::get(topic));
+    ASSERT_EQ(ResultOk, future.get(schemaInfo).result);
     ASSERT_EQ(keyValueSchema.getSchema(), schemaInfo.getSchema());
     ASSERT_EQ(SchemaType::KEY_VALUE, schemaInfo.getSchemaType());
     ASSERT_FALSE(schemaInfo.getProperties().empty());
@@ -464,9 +468,9 @@ INSTANTIATE_TEST_SUITE_P(Pulsar, LookupServiceTest, ::testing::Values(binaryLook
 
 class BinaryProtoLookupServiceRedirectTestHelper : public BinaryProtoLookupService {
    public:
-    BinaryProtoLookupServiceRedirectTestHelper(const std::string& serviceUrl, ConnectionPool& pool,
+    BinaryProtoLookupServiceRedirectTestHelper(const ServiceInfo& serviceInfo, ConnectionPool& pool,
                                                const ClientConfiguration& clientConfiguration)
-        : BinaryProtoLookupService(serviceUrl, pool, clientConfiguration) {}
+        : BinaryProtoLookupService(serviceInfo, pool, clientConfiguration) {}
 
     LookupResultFuture findBroker(const std::string& address, bool authoritative, const std::string& topic,
                                   size_t redirectCount) {
@@ -476,13 +480,14 @@ class BinaryProtoLookupServiceRedirectTestHelper : public BinaryProtoLookupServi
 
 TEST(LookupServiceTest, testRedirectionLimit) {
     const auto redirect_limit = 5;
-    AuthenticationPtr authData = AuthFactory::Disabled();
     ClientConfiguration conf;
     conf.setMaxLookupRedirects(redirect_limit);
     ExecutorServiceProviderPtr ioExecutorProvider_(std::make_shared<ExecutorServiceProvider>(1));
-    ConnectionPool pool_(conf, ioExecutorProvider_, authData, "");
-    string url = "pulsar://localhost:6650";
-    BinaryProtoLookupServiceRedirectTestHelper lookupService(url, pool_, conf);
+    AtomicSharedPtr<ServiceInfo> serviceInfo;
+    serviceInfo.store(std::make_shared<const ServiceInfo>(binaryLookupUrl));
+    ConnectionPool pool_(serviceInfo, conf, ioExecutorProvider_, "");
+    const ServiceInfo lookupServiceInfo{"pulsar://localhost:6650"};
+    BinaryProtoLookupServiceRedirectTestHelper lookupService(lookupServiceInfo, pool_, conf);
 
     const auto topicNamePtr = TopicName::get("topic");
     for (auto idx = 0; idx < redirect_limit + 5; ++idx) {
@@ -493,10 +498,74 @@ TEST(LookupServiceTest, testRedirectionLimit) {
 
         if (idx <= redirect_limit) {
             ASSERT_EQ(ResultOk, result);
-            ASSERT_EQ(url, lookupResult.logicalAddress);
-            ASSERT_EQ(url, lookupResult.physicalAddress);
+            ASSERT_EQ(lookupServiceInfo.serviceUrl(), lookupResult.logicalAddress);
+            ASSERT_EQ(lookupServiceInfo.serviceUrl(), lookupResult.physicalAddress);
         } else {
             ASSERT_EQ(ResultTooManyLookupRequestException, result);
         }
     }
+}
+
+class MockLookupService : public BinaryProtoLookupService {
+   public:
+    using BinaryProtoLookupService::BinaryProtoLookupService;
+
+    Future<Error, LookupDataResultPtr> getPartitionMetadataAsync(const TopicNamePtr& topicName) override {
+        bool expected = true;
+        if (firstTime_.compare_exchange_strong(expected, false)) {
+            // Trigger the retry
+            LOG_INFO("Fail the lookup for " << topicName->toString() << " intentionally");
+            Promise<Error, LookupDataResultPtr> promise;
+            promise.setFailed(Error{ResultRetryable, ""});
+            return promise.getFuture();
+        }
+        return BinaryProtoLookupService::getPartitionMetadataAsync(topicName);
+    }
+
+   private:
+    std::atomic_bool firstTime_{true};
+};
+
+TEST(LookupServiceTest, testAfterClientShutdown) {
+    auto client = std::make_shared<ClientImpl>(
+        "pulsar://localhost:6650", ClientConfiguration{},
+        [](const ServiceInfo& serviceInfo, const ClientConfiguration&, ConnectionPool& pool) {
+            return std::make_shared<MockLookupService>(serviceInfo, pool, ClientConfiguration{});
+        });
+
+    std::promise<Result> promise;
+    client->subscribeAsync("lookup-service-test-after-client-shutdown", "sub", ConsumerConfiguration{},
+                           [&promise](Result result, const Consumer&) { promise.set_value(result); });
+    // When shutdown is called, there is a pending lookup request due to the 1st lookup is failed in
+    // MockLookupService. Verify shutdown will cancel it and return ResultDisconnected.
+    client->shutdown();
+    EXPECT_EQ(ResultDisconnected, promise.get_future().get());
+
+    // A new subscribeAsync call will fail immediately in the current thread
+    Result result = ResultOk;
+    client->subscribeAsync("lookup-service-test-retry-after-destroyed", "sub", ConsumerConfiguration{},
+                           [&result](Result innerResult, const Consumer&) { result = innerResult; });
+    EXPECT_EQ(ResultAlreadyClosed, result);
+}
+
+TEST(LookupServiceTest, testRetryAfterDestroyed) {
+    auto executorProvider = std::make_shared<ExecutorServiceProvider>(1);
+    AtomicSharedPtr<ServiceInfo> serviceInfo;
+    serviceInfo.store(std::make_shared<const ServiceInfo>(binaryLookupUrl));
+    ConnectionPool pool(serviceInfo, {}, executorProvider, "");
+
+    auto internalLookupService = std::make_shared<MockLookupService>(ServiceInfo{"pulsar://localhost:6650"},
+                                                                     pool, ClientConfiguration{});
+    auto lookupService =
+        RetryableLookupService::create(internalLookupService, std::chrono::seconds(30), executorProvider);
+
+    // Simulate the race condition that `getPartitionMetadataAsync` is called after `close` is called on the
+    // lookup service. It's expected the request fails immediately with ResultAlreadyClosed.
+    lookupService->close();
+    Result result = ResultOk;
+    lookupService->getPartitionMetadataAsync(TopicName::get("lookup-service-test-retry-after-destroyed"))
+        .addListener([&result](const auto& error, const LookupDataResultPtr&) { result = error.result; });
+    EXPECT_EQ(ResultAlreadyClosed, result);
+    pool.close();
+    executorProvider->close();
 }

@@ -17,29 +17,55 @@
  * under the License.
  */
 #include <pulsar/Client.h>
+#include <pulsar/ServiceInfoProvider.h>
 
+#include <future>
 #include <iostream>
 #include <memory>
 #include <utility>
 
 #include "ClientImpl.h"
 #include "Int64SerDes.h"
-#include "LogUtils.h"
 #include "LookupService.h"
 #include "TopicName.h"
 #include "Utils.h"
 
-DECLARE_LOG_OBJECT()
-
 namespace pulsar {
 
-Client::Client(const std::shared_ptr<ClientImpl> impl) : impl_(impl) {}
+namespace {
 
-Client::Client(const std::string& serviceUrl)
-    : impl_(std::make_shared<ClientImpl>(serviceUrl, ClientConfiguration())) {}
+template <typename T>
+void setPromiseValue(std::promise<std::variant<Error, T>>& promise, const std::variant<Error, T>& value) {
+    if (const auto* error = std::get_if<Error>(&value)) {
+        promise.set_value(*error);
+    } else {
+        promise.set_value(std::get<T>(value));
+    }
+}
+
+template <typename T>
+void invokeLegacyCallback(const std::function<void(Result, T)>& callback,
+                          const std::variant<Error, T>& value) {
+    if (const auto* error = std::get_if<Error>(&value)) {
+        callback(error->result, T());
+    } else {
+        callback(ResultOk, std::get<T>(value));
+    }
+}
+
+}  // namespace
+
+Client::Client(const std::shared_ptr<ClientImpl>& impl) : impl_(impl) { impl_->initialize(); }
+
+Client::Client(const std::string& serviceUrl) : Client(serviceUrl, ClientConfiguration()) {}
 
 Client::Client(const std::string& serviceUrl, const ClientConfiguration& clientConfiguration)
-    : impl_(std::make_shared<ClientImpl>(serviceUrl, clientConfiguration)) {}
+    : Client(std::make_shared<ClientImpl>(serviceUrl, clientConfiguration)) {}
+
+Client Client::create(std::unique_ptr<ServiceInfoProvider> serviceInfoProvider,
+                      const ClientConfiguration& clientConfiguration) {
+    return Client(std::make_shared<ClientImpl>(std::move(serviceInfoProvider), clientConfiguration));
+}
 
 Result Client::createProducer(const std::string& topic, Producer& producer) {
     return createProducer(topic, ProducerConfiguration(), producer);
@@ -54,13 +80,32 @@ Result Client::createProducer(const std::string& topic, const ProducerConfigurat
     return future.get(producer);
 }
 
-void Client::createProducerAsync(const std::string& topic, CreateProducerCallback callback) {
+void Client::createProducerAsync(const std::string& topic, const CreateProducerCallback& callback) {
     createProducerAsync(topic, ProducerConfiguration(), callback);
 }
 
-void Client::createProducerAsync(const std::string& topic, ProducerConfiguration conf,
-                                 CreateProducerCallback callback) {
-    impl_->createProducerAsync(topic, conf, callback);
+void Client::createProducerAsync(const std::string& topic, const ProducerConfiguration& conf,
+                                 const CreateProducerCallback& callback) {
+    impl_->createProducerAsync(topic, conf, [callback](const auto& v) {
+        if (const auto* error = std::get_if<Error>(&v)) {
+            callback(error->result, Producer());
+        } else {
+            callback(ResultOk, std::get<Producer>(v));
+        }
+    });
+}
+
+void Client::createProducerAsyncV2(const std::string& topic, const ProducerConfiguration& conf,
+                                   CreateProducerV2Callback callback) {
+    impl_->createProducerAsync(topic, conf, std::move(callback));
+}
+
+std::variant<Error, Producer> Client::createProducerV2(const std::string& topic,
+                                                       const ProducerConfiguration& conf) {
+    std::promise<std::variant<Error, Producer>> promise;
+    createProducerAsyncV2(topic, conf,
+                          [&promise](const auto& v) mutable { setPromiseValue<Producer>(promise, v); });
+    return promise.get_future().get();
 }
 
 Result Client::subscribe(const std::string& topic, const std::string& subscriptionName, Consumer& consumer) {
@@ -77,14 +122,28 @@ Result Client::subscribe(const std::string& topic, const std::string& subscripti
 }
 
 void Client::subscribeAsync(const std::string& topic, const std::string& subscriptionName,
-                            SubscribeCallback callback) {
+                            const SubscribeCallback& callback) {
     subscribeAsync(topic, subscriptionName, ConsumerConfiguration(), callback);
 }
 
 void Client::subscribeAsync(const std::string& topic, const std::string& subscriptionName,
-                            const ConsumerConfiguration& conf, SubscribeCallback callback) {
-    LOG_INFO("Subscribing on Topic :" << topic);
-    impl_->subscribeAsync(topic, subscriptionName, conf, callback);
+                            const ConsumerConfiguration& conf, const SubscribeCallback& callback) {
+    subscribeAsyncV2(topic, subscriptionName, conf,
+                     [callback](const auto& value) { invokeLegacyCallback<Consumer>(callback, value); });
+}
+
+void Client::subscribeAsyncV2(const SubscribeTopics& topics, const std::string& subscriptionName,
+                              const ConsumerConfiguration& conf, SubscribeV2Callback callback) {
+    impl_->subscribeAsyncV2(topics, subscriptionName, conf, std::move(callback));
+}
+
+std::variant<Error, Consumer> Client::subscribeV2(const SubscribeTopics& topics,
+                                                  const std::string& subscriptionName,
+                                                  const ConsumerConfiguration& conf) {
+    std::promise<std::variant<Error, Consumer>> promise;
+    subscribeAsyncV2(topics, subscriptionName, conf,
+                     [&promise](const auto& v) mutable { setPromiseValue<Consumer>(promise, v); });
+    return promise.get_future().get();
 }
 
 Result Client::subscribe(const std::vector<std::string>& topics, const std::string& subscriptionName,
@@ -102,13 +161,14 @@ Result Client::subscribe(const std::vector<std::string>& topics, const std::stri
 }
 
 void Client::subscribeAsync(const std::vector<std::string>& topics, const std::string& subscriptionName,
-                            SubscribeCallback callback) {
+                            const SubscribeCallback& callback) {
     subscribeAsync(topics, subscriptionName, ConsumerConfiguration(), callback);
 }
 
 void Client::subscribeAsync(const std::vector<std::string>& topics, const std::string& subscriptionName,
-                            const ConsumerConfiguration& conf, SubscribeCallback callback) {
-    impl_->subscribeAsync(topics, subscriptionName, conf, callback);
+                            const ConsumerConfiguration& conf, const SubscribeCallback& callback) {
+    subscribeAsyncV2(topics, subscriptionName, conf,
+                     [callback](const auto& value) { invokeLegacyCallback<Consumer>(callback, value); });
 }
 
 Result Client::subscribeWithRegex(const std::string& regexPattern, const std::string& subscriptionName,
@@ -126,13 +186,14 @@ Result Client::subscribeWithRegex(const std::string& regexPattern, const std::st
 }
 
 void Client::subscribeWithRegexAsync(const std::string& regexPattern, const std::string& subscriptionName,
-                                     SubscribeCallback callback) {
+                                     const SubscribeCallback& callback) {
     subscribeWithRegexAsync(regexPattern, subscriptionName, ConsumerConfiguration(), callback);
 }
 
 void Client::subscribeWithRegexAsync(const std::string& regexPattern, const std::string& subscriptionName,
-                                     const ConsumerConfiguration& conf, SubscribeCallback callback) {
-    impl_->subscribeWithRegexAsync(regexPattern, subscriptionName, conf, callback);
+                                     const ConsumerConfiguration& conf, const SubscribeCallback& callback) {
+    subscribeAsyncV2(TopicRegex{regexPattern}, subscriptionName, conf,
+                     [callback](const auto& value) { invokeLegacyCallback<Consumer>(callback, value); });
 }
 
 Result Client::createReader(const std::string& topic, const MessageId& startMessageId,
@@ -145,8 +206,22 @@ Result Client::createReader(const std::string& topic, const MessageId& startMess
 }
 
 void Client::createReaderAsync(const std::string& topic, const MessageId& startMessageId,
-                               const ReaderConfiguration& conf, ReaderCallback callback) {
-    impl_->createReaderAsync(topic, startMessageId, conf, callback);
+                               const ReaderConfiguration& conf, const ReaderCallback& callback) {
+    createReaderAsyncV2(topic, startMessageId, conf,
+                        [callback](const auto& value) { invokeLegacyCallback<Reader>(callback, value); });
+}
+
+void Client::createReaderAsyncV2(const std::string& topic, const MessageId& startMessageId,
+                                 const ReaderConfiguration& conf, ReaderV2Callback callback) {
+    impl_->createReaderAsyncV2(topic, startMessageId, conf, std::move(callback));
+}
+
+std::variant<Error, Reader> Client::createReaderV2(const std::string& topic, const MessageId& startMessageId,
+                                                   const ReaderConfiguration& conf) {
+    std::promise<std::variant<Error, Reader>> promise;
+    createReaderAsyncV2(topic, startMessageId, conf,
+                        [&promise](const auto& v) mutable { setPromiseValue<Reader>(promise, v); });
+    return promise.get_future().get();
 }
 
 Result Client::createTableView(const std::string& topic, const TableViewConfiguration& conf,
@@ -159,19 +234,33 @@ Result Client::createTableView(const std::string& topic, const TableViewConfigur
 }
 
 void Client::createTableViewAsync(const std::string& topic, const TableViewConfiguration& conf,
-                                  TableViewCallback callBack) {
-    impl_->createTableViewAsync(topic, conf, callBack);
+                                  const TableViewCallback& callback) {
+    createTableViewAsyncV2(
+        topic, conf, [callback](const auto& value) { invokeLegacyCallback<TableView>(callback, value); });
+}
+
+void Client::createTableViewAsyncV2(const std::string& topic, const TableViewConfiguration& conf,
+                                    TableViewV2Callback callback) {
+    impl_->createTableViewAsyncV2(topic, conf, std::move(callback));
+}
+
+std::variant<Error, TableView> Client::createTableViewV2(const std::string& topic,
+                                                         const TableViewConfiguration& conf) {
+    std::promise<std::variant<Error, TableView>> promise;
+    createTableViewAsyncV2(topic, conf,
+                           [&promise](const auto& v) mutable { setPromiseValue<TableView>(promise, v); });
+    return promise.get_future().get();
 }
 
 Result Client::getPartitionsForTopic(const std::string& topic, std::vector<std::string>& partitions) {
-    Promise<Result, std::vector<std::string> > promise;
-    getPartitionsForTopicAsync(topic, WaitForCallbackValue<std::vector<std::string> >(promise));
-    Future<Result, std::vector<std::string> > future = promise.getFuture();
+    Promise<Result, std::vector<std::string>> promise;
+    getPartitionsForTopicAsync(topic, WaitForCallbackValue<std::vector<std::string>>(promise));
+    Future<Result, std::vector<std::string>> future = promise.getFuture();
 
     return future.get(partitions);
 }
 
-void Client::getPartitionsForTopicAsync(const std::string& topic, GetPartitionsCallback callback) {
+void Client::getPartitionsForTopicAsync(const std::string& topic, const GetPartitionsCallback& callback) {
     impl_->getPartitionsForTopicAsync(topic, callback);
 }
 
@@ -184,7 +273,7 @@ Result Client::close() {
     return result;
 }
 
-void Client::closeAsync(CloseCallback callback) { impl_->closeAsync(callback); }
+void Client::closeAsync(const CloseCallback& callback) { impl_->closeAsync(callback); }
 
 void Client::shutdown() { impl_->shutdown(); }
 
@@ -193,8 +282,12 @@ uint64_t Client::getNumberOfConsumers() { return impl_->getNumberOfConsumers(); 
 
 void Client::getSchemaInfoAsync(const std::string& topic, int64_t version,
                                 std::function<void(Result, const SchemaInfo&)> callback) {
-    impl_->getLookup()
-        ->getSchema(TopicName::get(topic), (version >= 0) ? toBigEndianBytes(version) : "")
-        .addListener(callback);
+    impl_->getSchema(TopicName::get(topic), (version >= 0) ? toBigEndianBytes(version) : "")
+        .addListener([callback{std::move(callback)}](const Error& error, const SchemaInfo& schemaInfo) {
+            callback(error.result, schemaInfo);
+        });
 }
+
+ServiceInfo Client::getServiceInfo() const { return impl_->getServiceInfo(); }
+
 }  // namespace pulsar

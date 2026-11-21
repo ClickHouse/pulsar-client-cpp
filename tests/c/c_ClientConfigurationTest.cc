@@ -31,4 +31,18 @@ TEST(C_ClientConfigurationTest, testCApiConfig) {
 
     pulsar_client_configuration_set_listener_name(conf, "listenerName");
     ASSERT_STREQ(pulsar_client_configuration_get_listener_name(conf), "listenerName");
+
+    pulsar_client_configuration_set_partitions_update_interval(conf, 10);
+    ASSERT_EQ(pulsar_client_configuration_get_partitions_update_interval(conf), 10);
+
+    pulsar_client_configuration_set_keep_alive_interval_in_seconds(conf, 60);
+    ASSERT_EQ(pulsar_client_configuration_get_keep_alive_interval_in_seconds(conf), 60);
+
+    ASSERT_EQ(pulsar_client_configuration_is_http_lookup_auth_allow_redirect(conf), 0);
+
+    pulsar_client_configuration_set_http_lookup_auth_allow_redirect(conf, 1);
+    ASSERT_EQ(pulsar_client_configuration_is_http_lookup_auth_allow_redirect(conf), 1);
+
+    pulsar_client_configuration_set_http_lookup_auth_allow_redirect(conf, 0);
+    ASSERT_EQ(pulsar_client_configuration_is_http_lookup_auth_allow_redirect(conf), 0);
 }

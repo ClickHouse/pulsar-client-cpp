@@ -46,8 +46,8 @@ class SharedBuffer {
     SharedBuffer& operator=(const SharedBuffer&) = default;
 
     // Move constructor.
-    SharedBuffer(SharedBuffer&& right) { *this = std::move(right); }
-    SharedBuffer& operator=(SharedBuffer&& right) {
+    SharedBuffer(SharedBuffer&& right) noexcept { *this = std::move(right); }
+    SharedBuffer& operator=(SharedBuffer&& right) noexcept {
         this->data_ = std::move(right.data_);
 
         this->ptr_ = right.ptr_;
@@ -151,11 +151,11 @@ class SharedBuffer {
 
     inline bool writable() const { return writableBytes() > 0; }
 
-    ASIO::const_buffers_1 const_asio_buffer() const {
-        return ASIO::const_buffers_1(ptr_ + readIdx_, readableBytes());
+    ASIO::const_buffer const_asio_buffer() const {
+        return ASIO::const_buffer(ptr_ + readIdx_, readableBytes());
     }
 
-    ASIO::mutable_buffers_1 asio_buffer() {
+    ASIO::mutable_buffer asio_buffer() {
         assert(data_);
         return ASIO::buffer(ptr_ + writeIdx_, writableBytes());
     }

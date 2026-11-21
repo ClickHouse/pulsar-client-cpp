@@ -20,16 +20,15 @@
 #define LIB_MESSAGECRYPTO_H_
 
 #include <openssl/bio.h>
-#include <openssl/engine.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
 #include <pulsar/CryptoKeyReader.h>
+#include <pulsar/EncryptionContext.h>
 
 #include <boost/date_time/posix_time/ptime.hpp>
 #include <boost/scoped_array.hpp>
-#include <iostream>
 #include <map>
 #include <mutex>
 #include <set>
@@ -62,7 +61,7 @@ class MessageCrypto {
      * @return ResultOk if succeeded
      *
      */
-    Result addPublicKeyCipher(const std::set<std::string>& keyNames, const CryptoKeyReaderPtr keyReader);
+    Result addPublicKeyCipher(const std::set<std::string>& keyNames, const CryptoKeyReaderPtr& keyReader);
 
     /*
      * Remove a key <p> Remove the key identified by the keyName from the list of keys.<p>
@@ -84,27 +83,27 @@ class MessageCrypto {
      *
      * @return true if success
      */
-    bool encrypt(const std::set<std::string>& encKeys, const CryptoKeyReaderPtr keyReader,
+    bool encrypt(const std::set<std::string>& encKeys, const CryptoKeyReaderPtr& keyReader,
                  proto::MessageMetadata& msgMetadata, SharedBuffer& payload, SharedBuffer& encryptedPayload);
 
     /*
      * Decrypt the payload using the data key. Keys used to encrypt data key can be retrieved from msgMetadata
      *
-     * @param msgMetadata Message Metadata
+     * @param context the encryption context
      * @param payload Message which needs to be decrypted
      * @param keyReader KeyReader implementation to retrieve key value
      * @param decryptedPayload Contains decrypted payload if success
      *
      * @return true if success
      */
-    bool decrypt(const proto::MessageMetadata& msgMetadata, SharedBuffer& payload,
-                 const CryptoKeyReaderPtr keyReader, SharedBuffer& decryptedPayload);
+    bool decrypt(const EncryptionContext& context, SharedBuffer& payload, const CryptoKeyReaderPtr& keyReader,
+                 SharedBuffer& decryptedPayload);
 
    private:
     typedef std::unique_lock<std::mutex> Lock;
     std::mutex mutex_;
 
-    int dataKeyLen_;
+    size_t dataKeyLen_;
     boost::scoped_array<unsigned char> dataKey_;
 
     int tagLen_;
@@ -125,18 +124,22 @@ class MessageCrypto {
 
     EVP_MD_CTX* mdCtx_;
 
-    RSA* loadPublicKey(std::string& pubKeyStr);
-    RSA* loadPrivateKey(std::string& privateKeyStr);
+    EVP_PKEY* loadPublicKey(std::string& pubKeyStr);
+    EVP_PKEY* loadPrivateKey(std::string& privateKeyStr);
+    bool rsaDecrypt(EVP_PKEY_CTX* ctx, const std::string& in, boost::scoped_array<unsigned char>& out,
+                    size_t& outLen);
+    bool rsaEncrypt(EVP_PKEY_CTX* ctx, boost::scoped_array<unsigned char>& in, size_t inLen,
+                    boost::scoped_array<unsigned char>& out, size_t& outLen);
     bool getDigest(const std::string& keyName, const void* input, unsigned int inputLen,
                    unsigned char keyDigest[], unsigned int& digestLen);
     void removeExpiredDataKey();
 
-    Result addPublicKeyCipher(const std::string& keyName, const CryptoKeyReaderPtr keyReader);
+    Result addPublicKeyCipher(const std::string& keyName, const CryptoKeyReaderPtr& keyReader);
 
-    bool decryptDataKey(const proto::EncryptionKeys& encKeys, const CryptoKeyReader& keyReader);
-    bool decryptData(const std::string& dataKeySecret, const proto::MessageMetadata& msgMetadata,
+    bool decryptDataKey(const EncryptionKey& encKeys, const CryptoKeyReader& keyReader);
+    bool decryptData(const std::string& dataKeySecret, const EncryptionContext& context,
                      SharedBuffer& payload, SharedBuffer& decPayload);
-    bool getKeyAndDecryptData(const proto::MessageMetadata& msgMetadata, SharedBuffer& payload,
+    bool getKeyAndDecryptData(const EncryptionContext& context, SharedBuffer& payload,
                               SharedBuffer& decryptedPayload);
     std::string stringToHex(const std::string& inputStr, size_t len);
     std::string stringToHex(const char* inputStr, size_t len);

@@ -20,6 +20,7 @@
 #include <pulsar/TopicMetadata.h>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -37,8 +38,6 @@ using ClientImplPtr = std::shared_ptr<ClientImpl>;
 using ClientImplWeakPtr = std::weak_ptr<ClientImpl>;
 class ExecutorService;
 using ExecutorServicePtr = std::shared_ptr<ExecutorService>;
-class LookupService;
-using LookupServicePtr = std::shared_ptr<LookupService>;
 class ProducerImpl;
 using ProducerImplPtr = std::shared_ptr<ProducerImpl>;
 class TopicName;
@@ -47,7 +46,7 @@ using TopicNamePtr = std::shared_ptr<TopicName>;
 class PartitionedProducerImpl : public ProducerImplBase,
                                 public std::enable_shared_from_this<PartitionedProducerImpl> {
    public:
-    enum State
+    enum State : uint8_t
     {
         Pending,
         Ready,
@@ -59,8 +58,9 @@ class PartitionedProducerImpl : public ProducerImplBase,
 
     typedef std::unique_lock<std::mutex> Lock;
 
-    PartitionedProducerImpl(ClientImplPtr ptr, const TopicNamePtr topicName, const unsigned int numPartitions,
-                            const ProducerConfiguration& config, const ProducerInterceptorsPtr& interceptors);
+    PartitionedProducerImpl(const ClientImplPtr& ptr, const TopicNamePtr& topicName,
+                            unsigned int numPartitions, const ProducerConfiguration& config,
+                            const ProducerInterceptorsPtr& interceptors);
     virtual ~PartitionedProducerImpl();
 
     // overrided methods from ProducerImplBase
@@ -75,18 +75,20 @@ class PartitionedProducerImpl : public ProducerImplBase,
     void closeAsync(CloseCallback callback) override;
     void start() override;
     void shutdown() override;
+    void internalShutdown();
     bool isClosed() override;
     const std::string& getTopic() const override;
-    Future<Result, ProducerImplBaseWeakPtr> getProducerCreatedFuture() override;
+    Future<Error, ProducerImplBaseWeakPtr> getProducerCreatedFuture() override;
     void triggerFlush() override;
     void flushAsync(FlushCallback callback) override;
     bool isConnected() const override;
     uint64_t getNumberOfConnectedProducer() override;
-    void handleSinglePartitionProducerCreated(Result result, ProducerImplBaseWeakPtr producerBaseWeakPtr,
+    void handleSinglePartitionProducerCreated(const Error& error,
+                                              const ProducerImplBaseWeakPtr& producerBaseWeakPtr,
                                               const unsigned int partitionIndex);
     void createLazyPartitionProducer(const unsigned int partitionIndex);
-    void handleSinglePartitionProducerClose(Result result, const unsigned int partitionIndex,
-                                            CloseCallback callback);
+    void handleSinglePartitionProducerClose(Result result, unsigned int partitionIndex,
+                                            const CloseCallback& callback);
 
     void notifyResult(CloseCallback closeCallback);
 
@@ -119,7 +121,7 @@ class PartitionedProducerImpl : public ProducerImplBase,
     std::atomic<State> state_{Pending};
 
     // only set this promise to value, when producers on all partitions are created.
-    Promise<Result, ProducerImplBaseWeakPtr> partitionedProducerCreatedPromise_;
+    Promise<Error, ProducerImplBaseWeakPtr> partitionedProducerCreatedPromise_;
 
     std::unique_ptr<TopicMetadata> topicMetadata_;
 
@@ -129,7 +131,6 @@ class PartitionedProducerImpl : public ProducerImplBase,
     ExecutorServicePtr listenerExecutor_;
     DeadlineTimerPtr partitionsUpdateTimer_;
     TimeDuration partitionsUpdateInterval_;
-    LookupServicePtr lookupServicePtr_;
 
     ProducerInterceptorsPtr interceptors_;
 

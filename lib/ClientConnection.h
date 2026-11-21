@@ -20,46 +20,54 @@
 #define _PULSAR_CLIENT_CONNECTION_HEADER_
 
 #include <pulsar/ClientConfiguration.h>
+#include <pulsar/ServiceInfo.h>
 #include <pulsar/defines.h>
 
+#include <any>
 #include <atomic>
+#include <cstdint>
+#include <future>
+#include <optional>
+
 #ifdef USE_ASIO
 #include <asio/bind_executor.hpp>
-#include <asio/io_service.hpp>
+#include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/ssl/stream.hpp>
 #include <asio/strand.hpp>
 #else
 #include <boost/asio/bind_executor.hpp>
-#include <boost/asio/io_service.hpp>
+#include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/stream.hpp>
 #include <boost/asio/strand.hpp>
 #endif
-#include <boost/any.hpp>
-#include <boost/optional.hpp>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "AsioTimer.h"
 #include "Commands.h"
+#include "ExecutorService.h"
 #include "GetLastMessageIdResponse.h"
 #include "LookupDataResult.h"
+#include "PendingRequest.h"
 #include "SharedBuffer.h"
 #include "TimeUtils.h"
 #include "UtilAllocator.h"
+
+using std::optional;
+
 namespace pulsar {
 
 class PulsarFriend;
 
 using TcpResolverPtr = std::shared_ptr<ASIO::ip::tcp::resolver>;
-
-class ExecutorService;
-using ExecutorServicePtr = std::shared_ptr<ExecutorService>;
 
 class ConnectionPool;
 class ClientConnection;
@@ -97,6 +105,8 @@ class CommandGetLastMessageIdResponse;
 class CommandLookupTopicResponse;
 class CommandPartitionedTopicMetadataResponse;
 class CommandProducerSuccess;
+class CommandReachedEndOfTopic;
+class CommandScalableTopicUpdate;
 class CommandSendReceipt;
 class CommandSendError;
 class CommandSuccess;
@@ -107,19 +117,22 @@ struct ResponseData {
     std::string producerName;
     int64_t lastSequenceId;
     std::string schemaVersion;
-    boost::optional<uint64_t> topicEpoch;
+    optional<uint64_t> topicEpoch;
 };
 
 typedef std::shared_ptr<std::vector<std::string>> NamespaceTopicsPtr;
 
+class MockServer;
 class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<ClientConnection> {
-    enum State
+    enum State : uint8_t
     {
         Pending,
         TcpConnected,
         Ready,
         Disconnected
     };
+    using RequestDelayType =
+        std::unordered_map<std::string /* request type */, long /* delay in milliseconds */>;
 
    public:
     typedef std::shared_ptr<ASIO::ip::tcp::socket> SocketPtr;
@@ -135,14 +148,10 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
      *
      */
     ClientConnection(const std::string& logicalAddress, const std::string& physicalAddress,
-                     ExecutorServicePtr executor, const ClientConfiguration& clientConfiguration,
-                     const AuthenticationPtr& authentication, const std::string& clientVersion,
+                     const ServiceInfo& serviceInfo, const ExecutorServicePtr& executor,
+                     const ClientConfiguration& clientConfiguration, const std::string& clientVersion,
                      ConnectionPool& pool, size_t poolIndex);
     ~ClientConnection();
-
-#if __cplusplus < 201703L
-    std::weak_ptr<ClientConnection> weak_from_this() noexcept { return shared_from_this(); }
-#endif
 
     /*
      * starts tcp connect_async
@@ -154,43 +163,59 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
      * Close the connection.
      *
      * @param result all pending futures will complete with this result
-     * @param detach remove it from the pool if it's true
-     *
-     * `detach` should only be false when the connection pool is closed.
+     * @param switchCluster whether the close is triggered by cluster switching
      */
-    void close(Result result = ResultConnectError, bool detach = true);
+    const std::future<void>& close(Error&& error = Error{ResultConnectError, ""}, bool switchCluster = false);
 
     bool isClosed() const;
 
-    Future<Result, ClientConnectionWeakPtr> getConnectFuture();
+    auto getConnectFuture() const { return connectPromise_.getFuture(); }
 
     Future<Result, ClientConnectionWeakPtr> getCloseFuture();
 
     void newTopicLookup(const std::string& topicName, bool authoritative, const std::string& listenerName,
-                        const uint64_t requestId, LookupDataResultPromisePtr promise);
+                        uint64_t requestId, const LookupDataResultPromisePtr& promise);
 
-    void newPartitionedMetadataLookup(const std::string& topicName, const uint64_t requestId,
-                                      LookupDataResultPromisePtr promise);
+    void newPartitionedMetadataLookup(const std::string& topicName, uint64_t requestId,
+                                      const LookupDataResultPromisePtr& promise);
 
     void sendCommand(const SharedBuffer& cmd);
     void sendCommandInternal(const SharedBuffer& cmd);
     void sendMessage(const std::shared_ptr<SendArguments>& args);
 
-    void registerProducer(int producerId, ProducerImplPtr producer);
-    void registerConsumer(int consumerId, ConsumerImplPtr consumer);
+    void registerProducer(int producerId, const ProducerImplPtr& producer);
+    void registerConsumer(int consumerId, const ConsumerImplPtr& consumer);
 
     void removeProducer(int producerId);
     void removeConsumer(int consumerId);
+
+    // Scalable topics (pulsar::st): a DAG-watch session registered on this
+    // connection. The listener is invoked with (ResultOk, &update) for every
+    // CommandScalableTopicUpdate whose session_id matches (the initial lookup
+    // response and later pushes alike), and with (error, nullptr) once when the
+    // connection closes, after which the registration is gone.
+    typedef std::function<void(Result, const proto::CommandScalableTopicUpdate*)> ScalableTopicUpdateListener;
+
+    /**
+     * Register a DAG-watch session. Returns false (without registering) if the
+     * connection is already closed — the caller should acquire a new connection.
+     */
+    bool registerScalableTopicSession(uint64_t sessionId, ScalableTopicUpdateListener listener);
+    void removeScalableTopicSession(uint64_t sessionId);
+
+    /** Whether the broker advertised scalable-topics support on CONNECTED. */
+    bool supportsScalableTopics() const { return supportsScalableTopics_.load(std::memory_order_acquire); }
 
     /**
      * Send a request with a specific Id over the connection. The future will be
      * triggered when the response for this request is received
      */
-    Future<Result, ResponseData> sendRequestWithId(SharedBuffer cmd, int requestId);
+    Future<Error, ResponseData> sendRequestWithId(const SharedBuffer& cmd, int requestId,
+                                                  const char* requestType);
 
     const std::string& brokerAddress() const;
 
-    const std::string& cnxString() const;
+    auto cnxString() const { return *std::atomic_load(&cnxStringPtr_); }
 
     int getServerProtocolVersion() const;
 
@@ -213,38 +238,26 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
                                                                CommandGetTopicsOfNamespace_Mode mode,
                                                                uint64_t requestId);
 
-    Future<Result, SchemaInfo> newGetSchema(const std::string& topicName, const std::string& version,
-                                            uint64_t requestId);
+    Future<Error, SchemaInfo> newGetSchema(const std::string& topicName, const std::string& version,
+                                           uint64_t requestId);
+
+    void attachMockServer(const std::shared_ptr<MockServer>& mockServer) {
+        mockServer_ = mockServer;
+        // Mark that requests will first go through the mock server, if the mock server cannot process it,
+        // fall back to the normal logic
+        mockingRequests_.store(true, std::memory_order_release);
+    }
+
+    void handleKeepAliveTimeout(const ASIO_ERROR& ec);
 
    private:
-    struct PendingRequestData {
-        Promise<Result, ResponseData> promise;
-        DeadlineTimerPtr timer;
-        std::shared_ptr<std::atomic_bool> hasGotResponse{std::make_shared<std::atomic_bool>(false)};
-    };
-
-    struct LookupRequestData {
-        LookupDataResultPromisePtr promise;
-        DeadlineTimerPtr timer;
-    };
-
-    struct LastMessageIdRequestData {
-        GetLastMessageIdResponsePromisePtr promise;
-        DeadlineTimerPtr timer;
-    };
-
-    struct GetSchemaRequest {
-        Promise<Result, SchemaInfo> promise;
-        DeadlineTimerPtr timer;
-    };
-
     /*
      * handler for connectAsync
      * creates a ConnectionPtr which has a valid ClientConnection object
      * although not usable at this point, since this is just tcp connection
      * Pulsar - Connect/Connected has yet to happen
      */
-    void handleTcpConnected(const ASIO_ERROR& err, ASIO::ip::tcp::resolver::iterator endpointIterator);
+    void handleTcpConnected(const ASIO_ERROR& err, const ASIO::ip::tcp::endpoint& endpoint);
 
     void handleHandshake(const ASIO_ERROR& err);
 
@@ -260,6 +273,7 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
                         proto::BaseCommand& incomingCmd);
 
     void handleActiveConsumerChange(const proto::CommandActiveConsumerChange& change);
+    void handleReachedEndOfTopic(const proto::CommandReachedEndOfTopic& reachedEndOfTopic);
     void handleIncomingCommand(proto::BaseCommand& incomingCmd);
     void handleIncomingMessage(const proto::CommandMessage& msg, bool isChecksumValid,
                                proto::BrokerEntryMetadata& brokerEntryMetadata,
@@ -267,20 +281,13 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
 
     void handlePulsarConnected(const proto::CommandConnected& cmdConnected);
 
-    void handleResolve(const ASIO_ERROR& err, ASIO::ip::tcp::resolver::iterator endpointIterator);
+    void handleResolve(ASIO_ERROR err, const ASIO::ip::tcp::resolver::results_type& results);
 
     void handleSend(const ASIO_ERROR& err, const SharedBuffer& cmd);
     void handleSendPair(const ASIO_ERROR& err);
     void sendPendingCommands();
-    void newLookup(const SharedBuffer& cmd, const uint64_t requestId, LookupDataResultPromisePtr promise);
-
-    void handleRequestTimeout(const ASIO_ERROR& ec, PendingRequestData pendingRequestData);
-
-    void handleLookupTimeout(const ASIO_ERROR&, LookupRequestData);
-
-    void handleGetLastMessageIdTimeout(const ASIO_ERROR&, LastMessageIdRequestData data);
-
-    void handleKeepAliveTimeout();
+    void newLookup(const SharedBuffer& cmd, uint64_t requestId, const char* requestType,
+                   const LookupDataResultPromisePtr& promise);
 
     template <typename Handler>
     inline AllocHandler<Handler> customAllocReadHandler(Handler h) {
@@ -293,28 +300,30 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
     }
 
     template <typename ConstBufferSequence, typename WriteHandler>
-    inline void asyncWrite(const ConstBufferSequence& buffers, WriteHandler handler) {
+    inline void asyncWrite(const ConstBufferSequence& buffers, WriteHandler&& handler) {
         if (isClosed()) {
             return;
         }
         if (tlsSocket_) {
-            ASIO::async_write(*tlsSocket_, buffers, ASIO::bind_executor(strand_, handler));
+            ASIO::async_write(*tlsSocket_, buffers, std::forward<WriteHandler>(handler));
         } else {
-            ASIO::async_write(*socket_, buffers, handler);
+            ASIO::async_write(*socket_, buffers, std::forward<WriteHandler>(handler));
         }
     }
 
     template <typename MutableBufferSequence, typename ReadHandler>
-    inline void asyncReceive(const MutableBufferSequence& buffers, ReadHandler handler) {
+    inline void asyncReceive(const MutableBufferSequence& buffers, ReadHandler&& handler) {
         if (isClosed()) {
             return;
         }
         if (tlsSocket_) {
-            tlsSocket_->async_read_some(buffers, ASIO::bind_executor(strand_, handler));
+            tlsSocket_->async_read_some(buffers, std::forward<ReadHandler>(handler));
         } else {
-            socket_->async_receive(buffers, handler);
+            socket_->async_receive(buffers, std::forward<ReadHandler>(handler));
         }
     }
+
+    void mockSendCommand(const char* requestType, uint64_t requestId, const SharedBuffer& cmd);
 
     std::atomic<State> state_{Pending};
     TimeDuration operationsTimeout_;
@@ -331,7 +340,6 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
      */
     SocketPtr socket_;
     TlsSocketPtr tlsSocket_;
-    ASIO::strand<ASIO::io_service::executor_type> strand_;
 
     const std::string logicalAddress_;
     /*
@@ -344,7 +352,7 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
     ClientConfiguration::ProxyProtocol proxyProtocol_;
 
     // Represent both endpoint of the tcp connection. eg: [client:1234 -> server:6650]
-    std::string cnxString_;
+    std::shared_ptr<std::string> cnxStringPtr_;
 
     /*
      *  indicates if async connection establishment failed
@@ -353,38 +361,61 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
 
     SharedBuffer incomingBuffer_;
 
-    Promise<Result, ClientConnectionWeakPtr> connectPromise_;
-    std::shared_ptr<PeriodicTask> connectTimeoutTask_;
+    Promise<Error, ClientConnectionWeakPtr> connectPromise_;
 
-    typedef std::map<long, PendingRequestData> PendingRequestsMap;
-    PendingRequestsMap pendingRequests_;
+    const std::chrono::milliseconds connectTimeout_;
+    const DeadlineTimerPtr connectTimer_;
 
-    typedef std::map<long, LookupRequestData> PendingLookupRequestsMap;
-    PendingLookupRequestsMap pendingLookupRequests_;
+    template <typename T>
+    using RequestMap = std::unordered_map<uint64_t, PendingRequestPtr<T>>;
 
-    typedef std::map<long, ProducerImplWeakPtr> ProducersMap;
+    RequestMap<ResponseData> pendingRequests_;
+    RequestMap<LookupDataResultPtr> pendingLookupRequests_;
+    RequestMap<GetLastMessageIdResponse> pendingGetLastMessageIdRequests_;
+    RequestMap<NamespaceTopicsPtr> pendingGetNamespaceTopicsRequests_;
+    RequestMap<SchemaInfo> pendingGetSchemaRequests_;
+
+    typedef std::unordered_map<long, ProducerImplWeakPtr> ProducersMap;
     ProducersMap producers_;
 
-    typedef std::map<long, ConsumerImplWeakPtr> ConsumersMap;
+    typedef std::unordered_map<long, ConsumerImplWeakPtr> ConsumersMap;
     ConsumersMap consumers_;
+
+    // Scalable topics: DAG-watch sessions by client-assigned session id.
+    typedef std::map<uint64_t, ScalableTopicUpdateListener> ScalableTopicSessionsMap;
+    ScalableTopicSessionsMap scalableTopicSessions_;
+    std::atomic<bool> supportsScalableTopics_{false};
 
     typedef std::map<uint64_t, Promise<Result, BrokerConsumerStatsImpl>> PendingConsumerStatsMap;
     PendingConsumerStatsMap pendingConsumerStatsMap_;
 
-    typedef std::map<long, LastMessageIdRequestData> PendingGetLastMessageIdRequestsMap;
-    PendingGetLastMessageIdRequestsMap pendingGetLastMessageIdRequests_;
-
-    typedef std::map<long, Promise<Result, NamespaceTopicsPtr>> PendingGetNamespaceTopicsMap;
-    PendingGetNamespaceTopicsMap pendingGetNamespaceTopicsRequests_;
-
-    typedef std::unordered_map<uint64_t, GetSchemaRequest> PendingGetSchemaMap;
-    PendingGetSchemaMap pendingGetSchemaRequests_;
-
     mutable std::mutex mutex_;
     typedef std::unique_lock<std::mutex> Lock;
 
+    // Note: this method must be called when holding `mutex_`
+    template <typename T, typename OnTimeout>
+    auto insertRequest(RequestMap<T>& pendingRequests, uint64_t requestId, OnTimeout onTimeout) {
+        auto request = std::make_shared<PendingRequest<T>>(
+            executor_->createTimer(operationsTimeout_),
+            [this, self{shared_from_this()}, requestId, onTimeout{std::move(onTimeout)},
+             &pendingRequests]() mutable {
+                {
+                    std::lock_guard lock{mutex_};
+                    if (auto it = pendingRequests.find(requestId); it != pendingRequests.end()) {
+                        pendingRequests.erase(it);
+                    }
+                }
+                onTimeout();
+            });
+        auto [iterator, inserted] = pendingRequests.emplace(requestId, request);
+        if (inserted) {
+            request->initialize();
+        }  // else: the request id is duplicated
+        return iterator->second;
+    }
+
     // Pending buffers to write on the socket
-    std::deque<boost::any> pendingWriteBuffers_;
+    std::deque<std::any> pendingWriteBuffers_;
     int pendingWriteOperations_ = 0;
 
     SharedBuffer outgoingBuffer_;
@@ -395,22 +426,29 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
     // Signals whether we're waiting for a response from broker
     bool havePendingPingRequest_ = false;
     bool isSniProxy_ = false;
+    unsigned int keepAliveIntervalInSeconds_;
     DeadlineTimerPtr keepAliveTimer_;
     DeadlineTimerPtr consumerStatsRequestTimer_;
 
-    void handleConsumerStatsTimeout(const ASIO_ERROR& ec, std::vector<uint64_t> consumerStatsRequests);
+    std::atomic_bool mockingRequests_{false};
+    std::shared_ptr<MockServer> mockServer_;
+
+    void handleConsumerStatsTimeout(const ASIO_ERROR& ec, const std::vector<uint64_t>& consumerStatsRequests);
 
     void startConsumerStatsTimer(std::vector<uint64_t> consumerStatsRequests);
     uint32_t maxPendingLookupRequest_;
-    uint32_t numOfPendingLookupRequest_ = 0;
+    std::atomic_uint32_t numOfPendingLookupRequest_{0};
 
     bool isTlsAllowInsecureConnection_ = false;
 
     const std::string clientVersion_;
     ConnectionPool& pool_;
     const size_t poolIndex_;
+    std::optional<std::future<void>> closeFuture_;
 
     friend class PulsarFriend;
+    friend class ConsumerTest;
+    friend class MockServer;
 
     void checkServerError(ServerError error, const std::string& message);
 
@@ -430,8 +468,9 @@ class PULSAR_PUBLIC ClientConnection : public std::enable_shared_from_this<Clien
     void handleGetTopicOfNamespaceResponse(const proto::CommandGetTopicsOfNamespaceResponse&);
     void handleGetSchemaResponse(const proto::CommandGetSchemaResponse&);
     void handleAckResponse(const proto::CommandAckResponse&);
-    boost::optional<std::string> getAssignedBrokerServiceUrl(const proto::CommandCloseProducer&);
-    boost::optional<std::string> getAssignedBrokerServiceUrl(const proto::CommandCloseConsumer&);
+    void handleScalableTopicUpdate(const proto::CommandScalableTopicUpdate&);
+    optional<std::string> getAssignedBrokerServiceUrl(const proto::CommandCloseProducer&);
+    optional<std::string> getAssignedBrokerServiceUrl(const proto::CommandCloseConsumer&);
     std::string getMigratedBrokerServiceUrl(const proto::CommandTopicMigrated&);
     // This method must be called when `mutex_` is held
     void unsafeRemovePendingRequest(long requestId);

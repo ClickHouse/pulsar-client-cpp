@@ -21,7 +21,6 @@
 #include "ClientImpl.h"
 #include "ExecutorService.h"
 #include "LogUtils.h"
-#include "LookupService.h"
 
 DECLARE_LOG_OBJECT()
 
@@ -30,12 +29,10 @@ using namespace pulsar;
 using std::chrono::seconds;
 
 PatternMultiTopicsConsumerImpl::PatternMultiTopicsConsumerImpl(
-    ClientImplPtr client, const std::string pattern, CommandGetTopicsOfNamespace_Mode getTopicsMode,
+    const ClientImplPtr& client, const std::string& pattern, CommandGetTopicsOfNamespace_Mode getTopicsMode,
     const std::vector<std::string>& topics, const std::string& subscriptionName,
-    const ConsumerConfiguration& conf, const LookupServicePtr lookupServicePtr_,
-    const ConsumerInterceptorsPtr interceptors)
-    : MultiTopicsConsumerImpl(client, topics, subscriptionName, TopicName::get(pattern), conf,
-                              lookupServicePtr_, interceptors),
+    const ConsumerConfiguration& conf, const ConsumerInterceptorsPtr& interceptors)
+    : MultiTopicsConsumerImpl(client, topics, subscriptionName, TopicName::get(pattern), conf, interceptors),
       patternString_(pattern),
       pattern_(PULSAR_REGEX_NAMESPACE::regex(TopicName::removeDomain(pattern))),
       getTopicsMode_(getTopicsMode),
@@ -48,7 +45,7 @@ const PULSAR_REGEX_NAMESPACE::regex PatternMultiTopicsConsumerImpl::getPattern()
 
 void PatternMultiTopicsConsumerImpl::resetAutoDiscoveryTimer() {
     autoDiscoveryRunning_ = false;
-    autoDiscoveryTimer_->expires_from_now(seconds(conf_.getPatternAutoDiscoveryPeriod()));
+    autoDiscoveryTimer_->expires_after(seconds(conf_.getPatternAutoDiscoveryPeriod()));
 
     auto weakSelf = weak_from_this();
     autoDiscoveryTimer_->async_wait([weakSelf](const ASIO_ERROR& err) {
@@ -84,13 +81,17 @@ void PatternMultiTopicsConsumerImpl::autoDiscoveryTimerTask(const ASIO_ERROR& er
     // already get namespace from pattern.
     assert(namespaceName_);
 
-    lookupServicePtr_->getTopicsOfNamespaceAsync(namespaceName_, getTopicsMode_)
+    auto client = client_.lock();
+    if (!client) {
+        return;
+    }
+    client->getTopicsOfNamespaceAsync(namespaceName_, getTopicsMode_)
         .addListener(std::bind(&PatternMultiTopicsConsumerImpl::timerGetTopicsOfNamespace, this,
                                std::placeholders::_1, std::placeholders::_2));
 }
 
-void PatternMultiTopicsConsumerImpl::timerGetTopicsOfNamespace(const Result result,
-                                                               const NamespaceTopicsPtr topics) {
+void PatternMultiTopicsConsumerImpl::timerGetTopicsOfNamespace(Result result,
+                                                               const NamespaceTopicsPtr& topics) {
     if (result != ResultOk) {
         LOG_ERROR("Error in Getting topicsOfNameSpace. result: " << result);
         resetAutoDiscoveryTimer();
@@ -118,6 +119,9 @@ void PatternMultiTopicsConsumerImpl::timerGetTopicsOfNamespace(const Result resu
     // callback method when added topics all subscribed.
     ResultCallback topicsAddedCallback = [this, topicsRemoved, topicsRemovedCallback](Result result) {
         if (result == ResultOk) {
+            if (messageListener_) {
+                resumeMessageListener();
+            }
             // call to unsubscribe all removed topics.
             onTopicsRemoved(topicsRemoved, topicsRemovedCallback);
         } else {
@@ -129,7 +133,8 @@ void PatternMultiTopicsConsumerImpl::timerGetTopicsOfNamespace(const Result resu
     onTopicsAdded(topicsAdded, topicsAddedCallback);
 }
 
-void PatternMultiTopicsConsumerImpl::onTopicsAdded(NamespaceTopicsPtr addedTopics, ResultCallback callback) {
+void PatternMultiTopicsConsumerImpl::onTopicsAdded(const NamespaceTopicsPtr& addedTopics,
+                                                   const ResultCallback& callback) {
     // start call subscribeOneTopicAsync for each single topic
 
     if (addedTopics->empty()) {
@@ -149,9 +154,9 @@ void PatternMultiTopicsConsumerImpl::onTopicsAdded(NamespaceTopicsPtr addedTopic
     }
 }
 
-void PatternMultiTopicsConsumerImpl::handleOneTopicAdded(const Result result, const std::string& topic,
-                                                         std::shared_ptr<std::atomic<int>> topicsNeedCreate,
-                                                         ResultCallback callback) {
+void PatternMultiTopicsConsumerImpl::handleOneTopicAdded(
+    Result result, const std::string& topic, const std::shared_ptr<std::atomic<int>>& topicsNeedCreate,
+    const ResultCallback& callback) {
     (*topicsNeedCreate)--;
 
     if (result != ResultOk) {
@@ -166,8 +171,8 @@ void PatternMultiTopicsConsumerImpl::handleOneTopicAdded(const Result result, co
     }
 }
 
-void PatternMultiTopicsConsumerImpl::onTopicsRemoved(NamespaceTopicsPtr removedTopics,
-                                                     ResultCallback callback) {
+void PatternMultiTopicsConsumerImpl::onTopicsRemoved(const NamespaceTopicsPtr& removedTopics,
+                                                     const ResultCallback& callback) {
     // start call subscribeOneTopicAsync for each single topic
     if (removedTopics->empty()) {
         LOG_DEBUG("no topics need unsubscribe");
@@ -205,7 +210,7 @@ NamespaceTopicsPtr PatternMultiTopicsConsumerImpl::topicsPatternFilter(
     for (const auto& topicStr : topics) {
         auto topic = TopicName::removeDomain(topicStr);
         if (PULSAR_REGEX_NAMESPACE::regex_match(topic, pattern)) {
-            topicsResultPtr->push_back(std::move(topicStr));
+            topicsResultPtr->push_back(topicStr);
         }
     }
     return topicsResultPtr;
@@ -228,7 +233,7 @@ void PatternMultiTopicsConsumerImpl::start() {
     LOG_DEBUG("PatternMultiTopicsConsumerImpl start autoDiscoveryTimer_.");
 
     if (conf_.getPatternAutoDiscoveryPeriod() > 0) {
-        autoDiscoveryTimer_->expires_from_now(seconds(conf_.getPatternAutoDiscoveryPeriod()));
+        autoDiscoveryTimer_->expires_after(seconds(conf_.getPatternAutoDiscoveryPeriod()));
         auto weakSelf = weak_from_this();
         autoDiscoveryTimer_->async_wait([weakSelf](const ASIO_ERROR& err) {
             if (auto self = weakSelf.lock()) {
@@ -238,17 +243,14 @@ void PatternMultiTopicsConsumerImpl::start() {
     }
 }
 
-void PatternMultiTopicsConsumerImpl::shutdown() {
+PatternMultiTopicsConsumerImpl::~PatternMultiTopicsConsumerImpl() {
     cancelTimers();
-    MultiTopicsConsumerImpl::shutdown();
+    internalShutdown();
 }
 
-void PatternMultiTopicsConsumerImpl::closeAsync(ResultCallback callback) {
+void PatternMultiTopicsConsumerImpl::closeAsync(const ResultCallback& callback) {
     cancelTimers();
     MultiTopicsConsumerImpl::closeAsync(callback);
 }
 
-void PatternMultiTopicsConsumerImpl::cancelTimers() noexcept {
-    ASIO_ERROR ec;
-    autoDiscoveryTimer_->cancel(ec);
-}
+void PatternMultiTopicsConsumerImpl::cancelTimers() noexcept { cancelTimer(*autoDiscoveryTimer_); }

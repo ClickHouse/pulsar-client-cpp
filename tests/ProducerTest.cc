@@ -215,6 +215,50 @@ TEST(ProducerTest, testBacklogQuotasExceeded) {
     client.close();
 }
 
+TEST(ProducerTest, testCreateProducerAfterTopicTermination) {
+    const auto topicName = "testCreateProducerAfterTopicTermination-" + std::to_string(time(nullptr));
+    const auto topic = "persistent://public/default/" + topicName;
+
+    Client client(serviceUrl, ClientConfiguration().setOperationTimeoutSeconds(1));
+
+    Producer producer;
+    ASSERT_EQ(ResultOk, client.createProducer(topic, producer));
+    ASSERT_EQ(ResultOk, producer.send(MessageBuilder().setContent("content").build()));
+    ASSERT_EQ(ResultOk, producer.close());
+
+    const auto httpCode =
+        makePostRequest(adminUrl + "admin/v2/persistent/public/default/" + topicName + "/terminate", "");
+    ASSERT_EQ(200, httpCode) << "httpCode: " << httpCode;
+
+    Producer terminatedProducer;
+    ASSERT_EQ(ResultTopicTerminated, client.createProducer(topic, terminatedProducer));
+
+    client.close();
+}
+
+TEST(ProducerTest, testSendAfterTopicTerminationReconnect) {
+    const auto topicName = "testSendAfterTopicTerminationReconnect-" + std::to_string(time(nullptr));
+    const auto topic = "persistent://public/default/" + topicName;
+
+    Client client(serviceUrl, ClientConfiguration().setOperationTimeoutSeconds(1));
+
+    Producer producer;
+    ASSERT_EQ(ResultOk, client.createProducer(topic, producer));
+    ASSERT_EQ(ResultOk, producer.send(MessageBuilder().setContent("before-terminate").build()));
+
+    const auto httpCode =
+        makePostRequest(adminUrl + "admin/v2/persistent/public/default/" + topicName + "/terminate", "");
+    ASSERT_EQ(200, httpCode) << "httpCode: " << httpCode;
+
+    PulsarFriend::getProducerImpl(producer).disconnectProducer();
+    ASSERT_TRUE(
+        waitUntil(std::chrono::seconds(3), [&producer] { return PulsarFriend::isTerminated(producer); }));
+
+    ASSERT_EQ(ResultTopicTerminated, producer.send(MessageBuilder().setContent("after-terminate").build()));
+
+    client.close();
+}
+
 class ProducerTest : public ::testing::TestWithParam<bool> {};
 
 TEST_P(ProducerTest, testMaxMessageSize) {
@@ -322,7 +366,7 @@ TEST(ProducerTest, testWaitForExclusiveProducer) {
 
     Latch latch(1);
     client.createProducerAsync(topicName, producerConfiguration2,
-                               [&latch, &producer2](Result res, Producer producer) {
+                               [&latch, &producer2](Result res, const Producer& producer) {
                                    ASSERT_EQ(ResultOk, res);
                                    producer2 = producer;
                                    latch.countdown();
@@ -357,7 +401,7 @@ TEST(ProducerTest, testExclusiveWithFencingProducer) {
 
     Latch latch(1);
     client.createProducerAsync(topicName, producerConfiguration2,
-                               [&latch, &producer2](Result res, Producer producer) {
+                               [&latch, &producer2](Result res, const Producer& producer) {
                                    // producer2 will be fenced
                                    ASSERT_EQ(ResultProducerFenced, res);
                                    latch.countdown();
@@ -385,7 +429,7 @@ TEST(ProducerTest, testExclusiveWithFencingProducer) {
     producerConfiguration2.setAccessMode(ProducerConfiguration::WaitForExclusive);
     Latch latch2(1);
     client.createProducerAsync(topicName, producerConfiguration2,
-                               [&latch2, &producer4](Result res, Producer producer) {
+                               [&latch2, &producer4](Result res, const Producer& producer) {
                                    // producer4 will be success
                                    ASSERT_EQ(ResultOk, res);
                                    producer4 = producer;
@@ -438,6 +482,44 @@ TEST_P(ProducerTest, testFlushNoBatch) {
     ASSERT_EQ(needCallBack.load(), 0);
     producer.close();
 
+    client.close();
+}
+
+// Verifies that getLastSequenceId() is correct after sendAsync + flush when batching is enabled.
+// Previously the batch used the last message's sequence_id, causing lastSequenceIdPublished_ to be
+// doubled (e.g. 3 messages yielded 4 instead of 2). The batch must use the first message's
+// sequence_id so that lastSequenceIdPublished_ = sequenceId + messagesCount - 1 is correct.
+TEST(ProducerTest, testGetLastSequenceIdAfterBatchFlush) {
+    Client client(serviceUrl);
+
+    const std::string topicName =
+        "persistent://public/default/testGetLastSequenceIdAfterBatchFlush-" + std::to_string(time(nullptr));
+
+    ProducerConfiguration producerConfiguration;
+    producerConfiguration.setBatchingEnabled(true);
+    producerConfiguration.setBatchingMaxMessages(10);
+    producerConfiguration.setBatchingMaxPublishDelayMs(60000);
+
+    Producer producer;
+    ASSERT_EQ(ResultOk, client.createProducer(topicName, producerConfiguration, producer));
+
+    // Send 3 messages in a batch, then flush. Sequence ids are [0, 1, 2], so getLastSequenceId() must be 2.
+    for (int i = 0; i < 3; i++) {
+        Message msg = MessageBuilder().setContent("content").build();
+        producer.sendAsync(msg, nullptr);
+    }
+    ASSERT_EQ(ResultOk, producer.flush());
+    ASSERT_EQ(producer.getLastSequenceId(), 2) << "After 3 messages, last sequence id should be 2";
+
+    // Send 2 more (total 5), flush. Sequence ids for these are [3, 4], so getLastSequenceId() must be 4.
+    for (int i = 0; i < 2; i++) {
+        Message msg = MessageBuilder().setContent("content").build();
+        producer.sendAsync(msg, nullptr);
+    }
+    ASSERT_EQ(ResultOk, producer.flush());
+    ASSERT_EQ(producer.getLastSequenceId(), 4) << "After 5 messages total, last sequence id should be 4";
+
+    producer.close();
     client.close();
 }
 
@@ -680,6 +762,37 @@ TEST(ProducerTest, testFailedToCreateNewPartitionProducer) {
         waitUntil(std::chrono::seconds(5), [&newProducer]() -> bool { return newProducer.isConnected(); }));
 
     producer.close();
+    client.close();
+}
+
+TEST(ProducerTest, testLargeProperties) {
+    const std::string topic = "producer-test-large-properties-" + std::to_string(time(nullptr));
+    Client client(serviceUrl);
+    Producer producer;
+    ProducerConfiguration conf;
+    conf.setBatchingEnabled(false);
+    ASSERT_EQ(ResultOk, client.createProducer(topic, conf, producer));
+    Consumer consumer;
+    ASSERT_EQ(ResultOk, client.subscribe(topic, "sub", consumer));
+
+    MessageBuilder::StringMap properties;
+    constexpr int propertyCount = 20000;
+    auto builder = MessageBuilder().setContent("msg");
+    for (int i = 0; i < propertyCount; i++) {
+        builder.setProperty("key" + std::to_string(i), "value-" + std::to_string(i));
+    }
+
+    // ASSERT_EQ(ResultOk,
+    // producer.send(MessageBuilder().setContent("msg").setProperties(properties).build()));
+    ASSERT_EQ(ResultOk, producer.send(builder.build()));
+
+    Message msg;
+    ASSERT_EQ(ResultOk, consumer.receive(msg, 3000));
+    ASSERT_EQ(msg.getProperties().size(), propertyCount);
+    for (int i = 0; i < propertyCount; i++) {
+        auto it = msg.getProperties().find("key" + std::to_string(i));
+        ASSERT_NE(it, msg.getProperties().cend());
+    }
     client.close();
 }
 

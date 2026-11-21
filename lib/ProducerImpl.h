@@ -26,7 +26,6 @@
 #include <boost/asio/steady_timer.hpp>
 #endif
 #include <atomic>
-#include <boost/optional.hpp>
 #include <list>
 #include <memory>
 
@@ -72,10 +71,11 @@ class MessageMetadata;
 
 class ProducerImpl : public HandlerBase, public ProducerImplBase {
    public:
-    ProducerImpl(ClientImplPtr client, const TopicName& topic,
+    ProducerImpl(const ClientImplPtr& client, const TopicName& topic,
                  const ProducerConfiguration& producerConfiguration,
                  const ProducerInterceptorsPtr& interceptors, int32_t partition = -1,
-                 bool retryOnCreationError = false);
+                 bool retryOnCreationError = false,
+                 const optional<std::string>& assignedBrokerUrl = std::nullopt);
     ~ProducerImpl();
 
     // overrided methods from ProducerImplBase
@@ -86,9 +86,10 @@ class ProducerImpl : public HandlerBase, public ProducerImplBase {
     void closeAsync(CloseCallback callback) override;
     void start() override;
     void shutdown() override;
+    void internalShutdown();
     bool isClosed() override;
     const std::string& getTopic() const override;
-    Future<Result, ProducerImplBaseWeakPtr> getProducerCreatedFuture() override;
+    Future<Error, ProducerImplBaseWeakPtr> getProducerCreatedFuture() override;
     void triggerFlush() override;
     void flushAsync(FlushCallback callback) override;
     bool isConnected() const override;
@@ -99,7 +100,7 @@ class ProducerImpl : public HandlerBase, public ProducerImplBase {
 
     bool ackReceived(uint64_t sequenceId, MessageId& messageId);
 
-    virtual void disconnectProducer(const boost::optional<std::string>& assignedBrokerUrl);
+    virtual void disconnectProducer(const optional<std::string>& assignedBrokerUrl);
     virtual void disconnectProducer();
 
     uint64_t getProducerId() const;
@@ -134,17 +135,17 @@ class ProducerImpl : public HandlerBase, public ProducerImplBase {
 
     // overrided methods from HandlerBase
     void beforeConnectionChange(ClientConnection& connection) override;
-    Future<Result, bool> connectionOpened(const ClientConnectionPtr& connection) override;
+    Future<Error, bool> connectionOpened(const ClientConnectionPtr& connection) override;
     void connectionFailed(Result result) override;
     const std::string& getName() const override { return producerStr_; }
 
    private:
     void printStats();
 
-    Result handleCreateProducer(const ClientConnectionPtr& cnx, Result result,
-                                const ResponseData& responseData);
+    Error handleCreateProducer(const ClientConnectionPtr& cnx, const Error& error,
+                               const ResponseData& responseData);
 
-    void resendMessages(ClientConnectionPtr cnx);
+    void resendMessages(const ClientConnectionPtr& cnx);
 
     void refreshEncryptionKey(const ASIO_ERROR& ec);
     bool encryptMessage(proto::MessageMetadata& metadata, SharedBuffer& payload,
@@ -178,6 +179,9 @@ class ProducerImpl : public HandlerBase, public ProducerImplBase {
     std::list<std::unique_ptr<OpSendMsg>> pendingMessagesQueue_;
 
     const int32_t partition_;  // -1 if topic is non-partitioned
+    // When set, the initial connect goes straight to this broker (no lookup) — used by
+    // scalable-topics per-segment producers pinned to the DAG-provided owner broker.
+    const optional<std::string> assignedBrokerUrl_;
     std::string producerName_;
     bool userProvidedProducerName_;
     std::string producerStr_;
@@ -199,7 +203,7 @@ class ProducerImpl : public HandlerBase, public ProducerImplBase {
     using DurationType = TimeDuration;
     void asyncWaitSendTimeout(DurationType expiryTime);
 
-    Promise<Result, ProducerImplBaseWeakPtr> producerCreatedPromise_;
+    Promise<Error, ProducerImplBaseWeakPtr> producerCreatedPromise_;
 
     struct PendingCallbacks;
     decltype(pendingMessagesQueue_) getPendingCallbacksWhenFailed();
@@ -212,7 +216,7 @@ class ProducerImpl : public HandlerBase, public ProducerImplBase {
 
     MemoryLimitController& memoryLimitController_;
     const bool chunkingEnabled_;
-    boost::optional<uint64_t> topicEpoch;
+    optional<uint64_t> topicEpoch;
 
     ProducerInterceptorsPtr interceptors_;
 

@@ -38,7 +38,6 @@
 #include "lib/AckGroupingTrackerEnabled.h"
 #include "lib/ClientConnection.h"
 #include "lib/ClientImpl.h"
-#include "lib/Commands.h"
 #include "lib/ConsumerImpl.h"
 #include "lib/Future.h"
 #include "lib/Latch.h"
@@ -78,14 +77,14 @@ static void messageListenerFunction(Consumer consumer, const Message &msg) {
     consumer.acknowledge(msg);
 }
 
-static void messageListenerFunctionWithoutAck(Consumer consumer, const Message &msg, Latch &latch,
+static void messageListenerFunctionWithoutAck(const Consumer &consumer, const Message &msg, Latch &latch,
                                               const std::string &content) {
     globalCount++;
     ASSERT_EQ(content, msg.getDataAsString());
     latch.countdown();
 }
 
-static void sendCallBack(Result r, const MessageId &msgId, std::string prefix, int *count) {
+static void sendCallBack(Result r, const MessageId &msgId, const std::string &prefix, int *count) {
     static std::mutex sendMutex_;
     sendMutex_.lock();
     ASSERT_EQ(r, ResultOk);
@@ -111,8 +110,8 @@ static void receiveCallBack(Result r, const Message &msg, std::string &messageCo
     receiveMutex_.unlock();
 }
 
-static void sendCallBackWithDelay(Result r, const MessageId &msgId, std::string prefix, double percentage,
-                                  uint64_t delayInMicros, int *count) {
+static void sendCallBackWithDelay(Result r, const MessageId &msgId, const std::string &prefix,
+                                  double percentage, uint64_t delayInMicros, int *count) {
     if ((rand() % 100) <= percentage) {
         std::this_thread::sleep_for(std::chrono::microseconds(delayInMicros));
     }
@@ -194,7 +193,7 @@ TEST(BasicEndToEndTest, testBatchMessages) {
     ASSERT_EQ(i, numOfMessages);
 }
 
-void resendMessage(Result r, const MessageId msgId, Producer producer) {
+void resendMessage(Result r, const MessageId &msgId, Producer &producer) {
     std::unique_lock<std::mutex> lock(mutex_);
     if (r != ResultOk) {
         LOG_DEBUG("globalResendMessageCount" << globalResendMessageCount);
@@ -243,9 +242,20 @@ TEST(BasicEndToEndTest, testProduceConsume) {
     Message receivedMsg;
     consumer.receive(receivedMsg);
     ASSERT_EQ(content, receivedMsg.getDataAsString());
+    ASSERT_FALSE(receivedMsg.getProducerName().empty());
+    ASSERT_EQ(ResultOk, producer.close());
+
+    ProducerConfiguration conf;
+    conf.setProducerName("test-producer");
+    ASSERT_EQ(ResultOk, client.createProducer(topicName, conf, producer));
+    producer.send(MessageBuilder().setContent("msg-2-content").build());
+    consumer.receive(receivedMsg);
+    ASSERT_EQ("msg-2-content", receivedMsg.getDataAsString());
+    ASSERT_EQ("test-producer", receivedMsg.getProducerName());
+    consumer.acknowledge(receivedMsg);
     ASSERT_EQ(ResultOk, consumer.unsubscribe());
     ASSERT_EQ(ResultOk, consumer.close());
-    ASSERT_EQ(ResultOk, producer.close());
+    ASSERT_EQ(ResultOk, consumer.close());
     ASSERT_EQ(ResultOk, client.close());
 }
 
@@ -425,6 +435,7 @@ TEST(BasicEndToEndTest, testProduceAndConsumeAfterClientClose) {
 
     Consumer consumer;
     result = client.subscribe(topicName, "my-sub-name", consumer);
+    ASSERT_EQ(ResultOk, result);
 
     // Clean dangling subscription
     consumer.unsubscribe();
@@ -494,6 +505,7 @@ TEST(BasicEndToEndTest, testSubscribeCloseUnsubscribeSherpaScenario) {
 
     Consumer consumer1;
     result = client.subscribe(topicName, subName, consumer1);
+    ASSERT_EQ(ResultOk, result);
     result = consumer1.unsubscribe();
     ASSERT_EQ(ResultOk, result);
 }
@@ -506,7 +518,7 @@ TEST(BasicEndToEndTest, testInvalidUrlPassed) {
     EXPECT_THROW({ Client{"Dream of the day when this will be a valid URL"}; }, std::invalid_argument);
 }
 
-void testPartitionedProducerConsumer(bool lazyStartPartitionedProducers, std::string topicName) {
+void testPartitionedProducerConsumer(bool lazyStartPartitionedProducers, const std::string &topicName) {
     Client client(lookupUrl);
 
     // call admin api to make it partitioned
@@ -688,7 +700,8 @@ TEST(BasicEndToEndTest, testConfigurationFile) {
 
     ClientConfiguration config2 = config1;
     AuthenticationDataPtr authData;
-    ASSERT_EQ(ResultOk, config1.getAuth().getAuthData(authData));
+    Client client(lookupUrl, config1);
+    ASSERT_EQ(ResultOk, client.getServiceInfo().authentication()->getAuthData(authData));
     ASSERT_EQ(100, config2.getOperationTimeoutSeconds());
     ASSERT_EQ(10, config2.getIOThreads());
     ASSERT_EQ(1, config2.getMessageListenerThreads());
@@ -709,6 +722,7 @@ TEST(BasicEndToEndTest, testSinglePartitionRoutingPolicy) {
     ProducerConfiguration producerConfiguration;
     producerConfiguration.setPartitionsRoutingMode(ProducerConfiguration::UseSinglePartition);
     Result result = client.createProducer(topicName, producerConfiguration, producer);
+    ASSERT_EQ(ResultOk, result);
 
     Consumer consumer;
     result = client.subscribe(topicName, "subscription-A", consumer);
@@ -884,6 +898,7 @@ TEST(BasicEndToEndTest, testMessageListener) {
     ProducerConfiguration producerConfiguration;
     producerConfiguration.setPartitionsRoutingMode(ProducerConfiguration::UseSinglePartition);
     Result result = client.createProducer(topicName, producerConfiguration, producer);
+    ASSERT_EQ(ResultOk, result);
 
     // Initializing global Count
     globalCount = 0;
@@ -927,6 +942,7 @@ TEST(BasicEndToEndTest, testMessageListenerPause) {
     ProducerConfiguration producerConfiguration;
     producerConfiguration.setPartitionsRoutingMode(ProducerConfiguration::UseSinglePartition);
     Result result = client.createProducer(topicName, producerConfiguration, producer);
+    ASSERT_EQ(ResultOk, result);
 
     // Initializing global Count
     globalCount = 0;
@@ -937,6 +953,7 @@ TEST(BasicEndToEndTest, testMessageListenerPause) {
     Consumer consumer;
     // Removing dangling subscription from previous test failures
     result = client.subscribe(topicName, "subscription-name", consumerConfig, consumer);
+    ASSERT_EQ(ResultOk, result);
     consumer.unsubscribe();
 
     result = client.subscribe(topicName, "subscription-name", consumerConfig, consumer);
@@ -983,6 +1000,7 @@ void testStartPaused(bool isPartitioned) {
 
     Producer producer;
     Result result = client.createProducer(topicName, producer);
+    ASSERT_EQ(ResultOk, result);
 
     // Initializing global Count
     globalCount = 0;
@@ -994,6 +1012,7 @@ void testStartPaused(bool isPartitioned) {
     Consumer consumer;
     // Removing dangling subscription from previous test failures
     result = client.subscribe(topicName, subName, consumerConfig, consumer);
+    ASSERT_EQ(ResultOk, result);
     consumer.unsubscribe();
 
     result = client.subscribe(topicName, subName, consumerConfig, consumer);
@@ -1164,7 +1183,7 @@ TEST(BasicEndToEndTest, testStatsLatencies) {
         ASSERT_EQ(expectedMessageContent, receivedMsg.getDataAsString());
         ASSERT_EQ(ResultOk, consumer.acknowledge(receivedMsg));
 
-        auto msgId = receivedMsg.getMessageId();
+        const auto &msgId = receivedMsg.getMessageId();
         if (msgId.batchIndex() < 0) {
             numAcks++;
         } else if (msgId.batchIndex() + 1 == msgId.batchSize()) {
@@ -1447,6 +1466,10 @@ TEST(BasicEndToEndTest, testRSAEncryption) {
             expected << msgContent << msgNum;
             ASSERT_EQ(expected.str(), msgReceived.getDataAsString());
             ASSERT_EQ(ResultOk, consumer.acknowledge(msgReceived));
+            auto context = msgReceived.getEncryptionContext();
+            ASSERT_TRUE(context.has_value());
+            ASSERT_EQ(context.value()->keys().size(), 1);
+            ASSERT_EQ(context.value()->keys()[0].key, "client-rsa.pem");
         }
 
         ASSERT_EQ(ResultOk, consumer.unsubscribe());
@@ -1556,6 +1579,7 @@ TEST(BasicEndToEndTest, testEncryptionFailure) {
     client.subscribeAsync(topicName, subName, consConfig, WaitForCallbackValue<Consumer>(consumerPromise3));
     consumerFuture = consumerPromise3.getFuture();
     result = consumerFuture.get(consumer);
+    ASSERT_EQ(ResultOk, result);
 
     for (; msgNum < totalMsgs - 1; msgNum++) {
         ASSERT_EQ(ResultOk, consumer.receive(msgReceived, 1000));
@@ -1575,6 +1599,7 @@ TEST(BasicEndToEndTest, testEncryptionFailure) {
     client.subscribeAsync(topicName, subName, consConfig2, WaitForCallbackValue<Consumer>(consumerPromise4));
     consumerFuture = consumerPromise4.getFuture();
     result = consumerFuture.get(consumer);
+    ASSERT_EQ(ResultOk, result);
 
     // Since messag is discarded, no message will be received.
     ASSERT_EQ(ResultTimeout, consumer.receive(msgReceived, 5000));
@@ -1687,9 +1712,11 @@ TEST(BasicEndToEndTest, testSeekOnPartitionedTopic) {
 
     std::string subName = "sub-testSeekOnPartitionedTopic";
     Producer producer;
+    ProducerConfiguration conf;
+    conf.setPartitionsRoutingMode(ProducerConfiguration::UseSinglePartition);
 
     Promise<Result, Producer> producerPromise;
-    client.createProducerAsync(topicName, WaitForCallbackValue<Producer>(producerPromise));
+    client.createProducerAsync(topicName, conf, WaitForCallbackValue<Producer>(producerPromise));
     Future<Result, Producer> producerFuture = producerPromise.getFuture();
     Result result = producerFuture.get(producer);
     ASSERT_EQ(ResultOk, result);
@@ -1793,7 +1820,7 @@ TEST(BasicEndToEndTest, testUnAckedMessageTimeout) {
 
 static long messagesReceived = 0;
 
-static void unackMessageListenerFunction(Consumer consumer, const Message &msg) { messagesReceived++; }
+static void unackMessageListenerFunction(const Consumer &consumer, const Message &msg) { messagesReceived++; }
 
 TEST(BasicEndToEndTest, testPartitionTopicUnAckedMessageTimeout) {
     Client client(lookupUrl);
@@ -2831,6 +2858,7 @@ void testFlushInPartitionedProducer(bool lazyStartPartitionedProducers) {
         partitionedConsumerId << consumerId << i;
         subscribeResult = client.subscribe(partitionedTopicName.str(), partitionedConsumerId.str(),
                                            consConfig, consumer[i]);
+        ASSERT_EQ(ResultOk, subscribeResult);
         consumer[i].unsubscribe();
         subscribeResult = client.subscribe(partitionedTopicName.str(), partitionedConsumerId.str(),
                                            consConfig, consumer[i]);
@@ -3161,7 +3189,17 @@ static void expectTimeoutOnRecv(Consumer &consumer) {
     ASSERT_EQ(ResultTimeout, res);
 }
 
-void testNegativeAcks(const std::string &topic, bool batchingEnabled) {
+static std::vector<std::string> expectedNegativeAckMessages(size_t numMessages) {
+    std::vector<std::string> expected;
+    expected.reserve(numMessages);
+    for (size_t i = 0; i < numMessages; i++) {
+        expected.emplace_back("test-" + std::to_string(i));
+    }
+    return expected;
+}
+
+void testNegativeAcks(const std::string &topic, bool batchingEnabled, bool expectOrdered = true) {
+    constexpr size_t numMessages = 10;
     Client client(lookupUrl);
     Consumer consumer;
     ConsumerConfiguration conf;
@@ -3175,21 +3213,31 @@ void testNegativeAcks(const std::string &topic, bool batchingEnabled) {
     result = client.createProducer(topic, producerConf, producer);
     ASSERT_EQ(ResultOk, result);
 
-    for (int i = 0; i < 10; i++) {
+    for (size_t i = 0; i < numMessages; i++) {
         Message msg = MessageBuilder().setContent("test-" + std::to_string(i)).build();
         producer.sendAsync(msg, nullptr);
     }
 
     producer.flush();
 
+    std::vector<std::string> receivedMessages;
+    receivedMessages.reserve(numMessages);
     std::vector<MessageId> toNeg;
-    for (int i = 0; i < 10; i++) {
+    for (size_t i = 0; i < numMessages; i++) {
         Message msg;
         consumer.receive(msg);
 
         LOG_INFO("Received message " << msg.getDataAsString());
-        ASSERT_EQ(msg.getDataAsString(), "test-" + std::to_string(i));
+        if (expectOrdered) {
+            ASSERT_EQ(msg.getDataAsString(), "test-" + std::to_string(i));
+        }
+        receivedMessages.emplace_back(msg.getDataAsString());
         toNeg.push_back(msg.getMessageId());
+    }
+    if (!expectOrdered) {
+        auto expectedMessages = expectedNegativeAckMessages(numMessages);
+        std::sort(receivedMessages.begin(), receivedMessages.end());
+        ASSERT_EQ(expectedMessages, receivedMessages);
     }
     // No more messages expected
     expectTimeoutOnRecv(consumer);
@@ -3201,14 +3249,24 @@ void testNegativeAcks(const std::string &topic, bool batchingEnabled) {
     }
     PulsarFriend::setNegativeAckEnabled(consumer, true);
 
-    for (int i = 0; i < 10; i++) {
+    std::vector<std::string> redeliveredMessages;
+    redeliveredMessages.reserve(numMessages);
+    for (size_t i = 0; i < numMessages; i++) {
         Message msg;
         consumer.receive(msg);
         LOG_INFO("-- Redelivery -- Received message " << msg.getDataAsString());
 
-        ASSERT_EQ(msg.getDataAsString(), "test-" + std::to_string(i));
+        if (expectOrdered) {
+            ASSERT_EQ(msg.getDataAsString(), "test-" + std::to_string(i));
+        }
+        redeliveredMessages.emplace_back(msg.getDataAsString());
 
         consumer.acknowledge(msg);
+    }
+    if (!expectOrdered) {
+        auto expectedMessages = expectedNegativeAckMessages(numMessages);
+        std::sort(redeliveredMessages.begin(), redeliveredMessages.end());
+        ASSERT_EQ(expectedMessages, redeliveredMessages);
     }
 
     // No more messages expected
@@ -3235,12 +3293,60 @@ TEST(BasicEndToEndTest, testNegativeAcksWithPartitions) {
     LOG_INFO("res = " << res);
     ASSERT_FALSE(res != 204 && res != 409);
 
-    testNegativeAcks(topicName, true);
+    testNegativeAcks(topicName, true, false);
+}
+
+void testNegativeAckPrecisionBitCnt(const std::string &topic, int precisionBitCnt) {
+    constexpr int delayMs = 2000;
+    const int64_t timeDeviation = 1L << precisionBitCnt;
+
+    Client client(lookupUrl);
+
+    Consumer consumer;
+    ConsumerConfiguration conf;
+    conf.setNegativeAckRedeliveryDelayMs(delayMs);
+    conf.setNegativeAckPrecisionBitCnt(precisionBitCnt);
+
+    Result result = client.subscribe(topic, "sub1", conf, consumer);
+    ASSERT_EQ(ResultOk, result);
+
+    Producer producer;
+    ProducerConfiguration producerConf;
+    result = client.createProducer(topic, producerConf, producer);
+    ASSERT_EQ(ResultOk, result);
+
+    Message msg = MessageBuilder().setContent("test-0").build();
+    producer.sendAsync(msg, nullptr);
+    producer.flush();
+
+    // receive and trigger negative ack
+    Message received;
+    consumer.receive(received);
+    consumer.negativeAcknowledge(received);
+
+    int64_t expectedRedeliveryTime = TimeUtils::currentTimeMillis() + delayMs;
+
+    Message redelivered;
+    consumer.receive(redelivered);
+    int64_t now = TimeUtils::currentTimeMillis();
+    ASSERT_GE(now, expectedRedeliveryTime - timeDeviation);
+    ASSERT_EQ(redelivered.getDataAsString(), "test-0");
+
+    consumer.acknowledge(redelivered);
+    client.shutdown();
+}
+
+TEST(BasicEndToEndTest, testNegativeAckPrecisionBitCnt) {
+    for (int precisionBitCnt = 1; precisionBitCnt <= 12; precisionBitCnt++) {
+        std::string topic = "testNegativeAckPrecisionBitCnt-" + std::to_string(precisionBitCnt) + "-" +
+                            std::to_string(time(nullptr));
+        testNegativeAckPrecisionBitCnt(topic, precisionBitCnt);
+    }
 }
 
 static long regexTestMessagesReceived = 0;
 
-static void regexMessageListenerFunction(Consumer consumer, const Message &msg) {
+static void regexMessageListenerFunction(const Consumer &consumer, const Message &msg) {
     regexTestMessagesReceived++;
 }
 
@@ -3417,7 +3523,7 @@ TEST(BasicEndToEndTest, testDelayedMessages) {
     ASSERT_EQ("msg-2", msgReceived.getDataAsString());
 
     auto result1 = client.close();
-    std::cout << "closed with " << result1 << std::endl;
+    std::cout << "closed with " << result1 << '\n';
     ASSERT_EQ(ResultOk, result1);
 }
 
@@ -3572,7 +3678,7 @@ TEST(BasicEndToEndTest, testAckGroupingTrackerDefaultBehavior) {
     ASSERT_EQ(configConsumer.getAckGroupingTimeMs(), 100);
     ASSERT_EQ(configConsumer.getAckGroupingMaxSize(), 1000);
 
-    AckGroupingTracker tracker{nullptr, nullptr, 0, false};
+    AckGroupingTracker tracker;
     Message msg;
     ASSERT_FALSE(tracker.isDuplicate(msg.getMessageId()));
 }
@@ -3611,10 +3717,8 @@ TEST(BasicEndToEndTest, testAckGroupingTrackerSingleAckBehavior) {
 
     // Send ACK.
     auto clientImplPtr = PulsarFriend::getClientImplPtr(client);
-    AckGroupingTrackerDisabled tracker([&consumerImpl]() { return consumerImpl.getCnx().lock(); },
-                                       [&clientImplPtr] { return clientImplPtr->newRequestId(); },
-                                       consumerImpl.getConsumerId(), false);
-    tracker.start();
+    AckGroupingTrackerDisabled tracker;
+    tracker.start(PulsarFriend::getConsumerImplPtr(consumer));
     for (auto msgIdx = 0; msgIdx < numMsg; ++msgIdx) {
         auto connPtr = connWeakPtr.lock();
         ASSERT_NE(connPtr, nullptr);
@@ -3646,8 +3750,6 @@ TEST(BasicEndToEndTest, testAckGroupingTrackerMultiAckBehavior) {
     Consumer consumer;
     ASSERT_EQ(ResultOk, client.subscribe(topicName, subName, consumer));
 
-    auto &consumerImpl = PulsarFriend::getConsumerImpl(consumer);
-
     // Sending and receiving messages.
     for (auto count = 0; count < numMsg; ++count) {
         Message msg = MessageBuilder().setContent(std::string("MSG-") + std::to_string(count)).build();
@@ -3663,10 +3765,8 @@ TEST(BasicEndToEndTest, testAckGroupingTrackerMultiAckBehavior) {
 
     // Send ACK.
     auto clientImplPtr = PulsarFriend::getClientImplPtr(client);
-    AckGroupingTrackerDisabled tracker([&consumerImpl]() { return consumerImpl.getCnx().lock(); },
-                                       [&clientImplPtr] { return clientImplPtr->newRequestId(); },
-                                       consumerImpl.getConsumerId(), false);
-    tracker.start();
+    AckGroupingTrackerDisabled tracker;
+    tracker.start(PulsarFriend::getConsumerImplPtr(consumer));
     tracker.addAcknowledgeList(recvMsgId, nullptr);
     consumer.close();
 
@@ -3694,7 +3794,6 @@ TEST(BasicEndToEndTest, testAckGroupingTrackerDisabledIndividualAck) {
 
     Consumer consumer;
     ASSERT_EQ(ResultOk, client.subscribe(topicName, subName, consumer));
-    auto &consumerImpl = PulsarFriend::getConsumerImpl(consumer);
 
     // Sending and receiving messages.
     for (auto count = 0; count < numMsg; ++count) {
@@ -3710,8 +3809,8 @@ TEST(BasicEndToEndTest, testAckGroupingTrackerDisabledIndividualAck) {
     }
 
     // Send ACK.
-    AckGroupingTrackerDisabled tracker([&consumerImpl] { return consumerImpl.getCnx().lock(); }, nullptr,
-                                       consumerImpl.getConsumerId(), false);
+    AckGroupingTrackerDisabled tracker;
+    tracker.start(PulsarFriend::getConsumerImplPtr(consumer));
     for (auto &msgId : recvMsgId) {
         tracker.addAcknowledge(msgId, nullptr);
     }
@@ -3741,7 +3840,6 @@ TEST(BasicEndToEndTest, testAckGroupingTrackerDisabledCumulativeAck) {
 
     Consumer consumer;
     ASSERT_EQ(ResultOk, client.subscribe(topicName, subName, consumer));
-    auto &consumerImpl = PulsarFriend::getConsumerImpl(consumer);
 
     // Sending and receiving messages.
     for (auto count = 0; count < numMsg; ++count) {
@@ -3757,8 +3855,8 @@ TEST(BasicEndToEndTest, testAckGroupingTrackerDisabledCumulativeAck) {
     }
 
     // Send ACK.
-    AckGroupingTrackerDisabled tracker([&consumerImpl] { return consumerImpl.getCnx().lock(); }, nullptr,
-                                       consumerImpl.getConsumerId(), false);
+    AckGroupingTrackerDisabled tracker;
+    tracker.start(PulsarFriend::getConsumerImplPtr(consumer));
     auto &latestMsgId = *std::max_element(recvMsgId.begin(), recvMsgId.end());
     tracker.addAcknowledgeCumulative(latestMsgId, nullptr);
     consumer.close();
@@ -3800,7 +3898,6 @@ TEST(BasicEndToEndTest, testAckGroupingTrackerEnabledIndividualAck) {
 
     Consumer consumer;
     ASSERT_EQ(ResultOk, client.subscribe(topicName, subName, consumer));
-    auto consumerImpl = PulsarFriend::getConsumerImplPtr(consumer);
 
     // Sending and receiving messages.
     for (auto count = 0; count < numMsg; ++count) {
@@ -3816,9 +3913,8 @@ TEST(BasicEndToEndTest, testAckGroupingTrackerEnabledIndividualAck) {
     }
 
     auto tracker = std::make_shared<AckGroupingTrackerEnabledMock>(
-        [&consumerImpl] { return consumerImpl->getCnx().lock(); }, nullptr, consumerImpl->getConsumerId(),
-        false, ackGroupingTimeMs, ackGroupingMaxSize, clientImplPtr->getIOExecutorProvider()->get());
-    tracker->start();
+        ackGroupingTimeMs, ackGroupingMaxSize, false, clientImplPtr->getIOExecutorProvider()->get());
+    tracker->start(PulsarFriend::getConsumerImplPtr(consumer));
     ASSERT_EQ(tracker->getPendingIndividualAcks().size(), 0);
     ASSERT_EQ(tracker->getAckGroupingTimeMs(), ackGroupingTimeMs);
     ASSERT_EQ(tracker->getAckGroupingMaxSize(), ackGroupingMaxSize);
@@ -3878,9 +3974,8 @@ TEST(BasicEndToEndTest, testAckGroupingTrackerEnabledCumulativeAck) {
     std::sort(recvMsgId.begin(), recvMsgId.end());
 
     auto tracker0 = std::make_shared<AckGroupingTrackerEnabledMock>(
-        [&consumerImpl0] { return consumerImpl0->getCnx().lock(); }, nullptr, consumerImpl0->getConsumerId(),
-        false, ackGroupingTimeMs, ackGroupingMaxSize, clientImplPtr->getIOExecutorProvider()->get());
-    tracker0->start();
+        ackGroupingTimeMs, ackGroupingMaxSize, false, clientImplPtr->getIOExecutorProvider()->get());
+    tracker0->start(PulsarFriend::getConsumerImplPtr(consumer));
     ASSERT_EQ(tracker0->getNextCumulativeAckMsgId(), MessageId::earliest());
     ASSERT_FALSE(tracker0->requireCumulativeAck());
 
@@ -3915,9 +4010,8 @@ TEST(BasicEndToEndTest, testAckGroupingTrackerEnabledCumulativeAck) {
     auto ret = consumer.receive(msg, 1000);
     ASSERT_EQ(ResultTimeout, ret) << "Received redundant message: " << msg.getDataAsString();
     auto tracker1 = std::make_shared<AckGroupingTrackerEnabledMock>(
-        [&consumerImpl1] { return consumerImpl1->getCnx().lock(); }, nullptr, consumerImpl1->getConsumerId(),
-        false, ackGroupingTimeMs, ackGroupingMaxSize, clientImplPtr->getIOExecutorProvider()->get());
-    tracker1->start();
+        ackGroupingTimeMs, ackGroupingMaxSize, false, clientImplPtr->getIOExecutorProvider()->get());
+    tracker1->start(PulsarFriend::getConsumerImplPtr(consumer));
     tracker1->addAcknowledgeCumulative(recvMsgId[numMsg - 1], nullptr);
     tracker1->close();
     consumer.close();
@@ -3929,7 +4023,7 @@ TEST(BasicEndToEndTest, testAckGroupingTrackerEnabledCumulativeAck) {
 
 class UnAckedMessageTrackerEnabledMock : public UnAckedMessageTrackerEnabled {
    public:
-    UnAckedMessageTrackerEnabledMock(long timeoutMs, const ClientImplPtr client, ConsumerImplBase &consumer)
+    UnAckedMessageTrackerEnabledMock(long timeoutMs, const ClientImplPtr &client, ConsumerImplBase &consumer)
         : UnAckedMessageTrackerEnabled(timeoutMs, timeoutMs, client, consumer) {}
     const long getUnAckedMessagesTimeoutMs() { return this->timeoutMs_; }
     const long getTickDurationInMs() { return this->tickDurationInMs_; }
@@ -4202,8 +4296,8 @@ void testBatchReceive(bool multiConsumer) {
     ASSERT_EQ(ResultOk, producer.flush());
     for (int i = 0; i < numOfMessages / batchReceiveMaxNumMessages; i++) {
         Latch latch(1);
-        BatchReceiveCallback batchReceiveCallback = [&latch, batchReceiveMaxNumMessages](Result result,
-                                                                                         Messages messages) {
+        BatchReceiveCallback batchReceiveCallback = [&latch, batchReceiveMaxNumMessages](
+                                                        Result result, const Messages &messages) {
             ASSERT_EQ(result, ResultOk);
             ASSERT_EQ(messages.size(), batchReceiveMaxNumMessages);
             latch.countdown();
@@ -4265,7 +4359,8 @@ void testBatchReceiveTimeout(bool multiConsumer) {
     }
 
     Latch latch(1);
-    BatchReceiveCallback batchReceiveCallback = [&latch, numOfMessages](Result result, Messages messages) {
+    BatchReceiveCallback batchReceiveCallback = [&latch, numOfMessages](Result result,
+                                                                        const Messages &messages) {
         ASSERT_EQ(result, ResultOk);
         ASSERT_EQ(messages.size(), numOfMessages);
         latch.countdown();
@@ -4310,7 +4405,7 @@ void testBatchReceiveClose(bool multiConsumer) {
     ASSERT_EQ(ResultOk, result);
 
     Latch latch(1);
-    BatchReceiveCallback batchReceiveCallback = [&latch](Result result, Messages messages) {
+    BatchReceiveCallback batchReceiveCallback = [&latch](Result result, const Messages &messages) {
         ASSERT_EQ(result, ResultAlreadyClosed);
         latch.countdown();
     };

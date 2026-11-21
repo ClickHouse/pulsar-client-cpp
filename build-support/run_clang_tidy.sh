@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env bash
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -18,7 +18,26 @@
 # under the License.
 #
 
-import yaml, sys
+set -e
+cd `dirname $0`/..
 
-deps = yaml.safe_load(open('dependencies.yaml'))
-print(deps[sys.argv[1]])
+FILES=$(find $PWD/include $PWD/lib $PWD/tests $PWD/examples -name "*.h" -o -name "*.cc" \
+    | grep -v "lib\/c\/" | grep -v "lib\/checksum\/" | grep -v "lib\/lz4\/" \
+    | grep -v "include\/pulsar\/c\/" | grep -v "tests\/c\/")
+
+rm -f files.txt
+for FILE in $FILES; do
+    echo $FILE >> files.txt
+done
+# run-clang-tidy from older version of LLVM requires python but not python3 as the env, so we cannot run it directly
+SCRIPT=$(which run-clang-tidy)
+set +e
+nproc
+if [[ $? == 0 ]]; then
+    NUM_THREADS=$(nproc)
+else
+    NUM_THREADS=8
+fi
+set -e
+python3 $SCRIPT -p build -j$NUM_THREADS $(cat files.txt)
+rm -f files.txt

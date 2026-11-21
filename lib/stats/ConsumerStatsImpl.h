@@ -27,11 +27,7 @@
 
 #include "ConsumerStatsBase.h"
 #include "lib/AsioTimer.h"
-#include "lib/ExecutorService.h"
 namespace pulsar {
-
-class ExecutorService;
-using ExecutorServicePtr = std::shared_ptr<ExecutorService>;
 
 class ConsumerStatsImpl : public std::enable_shared_from_this<ConsumerStatsImpl>, public ConsumerStatsBase {
    private:
@@ -55,14 +51,11 @@ class ConsumerStatsImpl : public std::enable_shared_from_this<ConsumerStatsImpl>
     friend class PulsarFriend;
 
    public:
-    ConsumerStatsImpl(std::string, ExecutorServicePtr, unsigned int);
+    ConsumerStatsImpl(const std::string&, DeadlineTimerPtr, unsigned int);
     ConsumerStatsImpl(const ConsumerStatsImpl& stats);
     void flushAndReset(const ASIO_ERROR&);
     void start() override;
-    void stop() override {
-        ASIO_ERROR error;
-        timer_->cancel(error);
-    }
+    void stop() override { cancelTimer(*timer_); }
     void receivedMessage(Message&, Result) override;
     void messageAcknowledged(Result, CommandAck_AckType, uint32_t ackNums) override;
     virtual ~ConsumerStatsImpl();

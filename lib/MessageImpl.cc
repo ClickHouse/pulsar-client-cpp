@@ -63,11 +63,11 @@ void MessageImpl::setReplicationClusters(const std::vector<std::string>& cluster
 }
 
 void MessageImpl::disableReplication(bool flag) {
-    google::protobuf::RepeatedPtrField<std::string> r;
+    google::protobuf::RepeatedPtrField<std::string>* replicateTo = metadata.mutable_replicate_to();
+    replicateTo->Clear();
     if (flag) {
-        r.AddAllocated(new std::string("__local__"));
+        replicateTo->Add("__local__");
     }
-    r.Swap(metadata.mutable_replicate_to());
 }
 
 void MessageImpl::setProperty(const std::string& name, const std::string& value) {
@@ -90,7 +90,10 @@ void MessageImpl::setTopicName(const std::shared_ptr<std::string>& topicName) {
     messageId.setTopicName(topicName);
 }
 
-const std::string& MessageImpl::getTopicName() { return *topicName_; }
+const std::string& MessageImpl::getTopicName() {
+    static const std::string emptyString = "";
+    return topicName_ ? *topicName_ : emptyString;
+}
 
 int MessageImpl::getRedeliveryCount() { return redeliveryCount_; }
 
@@ -124,7 +127,7 @@ void MessageImpl::convertPayloadToKeyValue(const pulsar::SchemaInfo& schemaInfo)
                                        getKeyValueEncodingType(schemaInfo));
 }
 
-KeyValueEncodingType MessageImpl::getKeyValueEncodingType(SchemaInfo schemaInfo) {
+KeyValueEncodingType MessageImpl::getKeyValueEncodingType(const SchemaInfo& schemaInfo) {
     if (schemaInfo.getSchemaType() != KEY_VALUE) {
         throw std::invalid_argument("Schema not key value type.");
     }

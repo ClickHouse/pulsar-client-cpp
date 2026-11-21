@@ -35,6 +35,7 @@
 #include "OpSendMsg.h"
 #include "PulsarApi.pb.h"
 #include "Url.h"
+#include "boost/throw_exception.hpp"
 #include "checksum/ChecksumProvider.h"
 
 using namespace pulsar;
@@ -55,6 +56,7 @@ using proto::CommandLookupTopic;
 using proto::CommandPartitionedTopicMetadata;
 using proto::CommandProducer;
 using proto::CommandRedeliverUnacknowledgedMessages;
+using proto::CommandScalableTopicLookup;
 using proto::CommandSeek;
 using proto::CommandSend;
 using proto::CommandSubscribe;
@@ -139,7 +141,7 @@ SharedBuffer Commands::newPartitionMetadataRequest(const std::string& topic, uin
     CommandPartitionedTopicMetadata* partitionMetadata = cmd.mutable_partitionmetadata();
     partitionMetadata->set_topic(topic);
     partitionMetadata->set_request_id(requestId);
-    const SharedBuffer buffer = writeMessageWithSize(cmd);
+    SharedBuffer buffer = writeMessageWithSize(cmd);
     cmd.clear_partitionmetadata();
     return buffer;
 }
@@ -155,7 +157,7 @@ SharedBuffer Commands::newLookup(const std::string& topic, const bool authoritat
     lookup->set_authoritative(authoritative);
     lookup->set_request_id(requestId);
     lookup->set_advertised_listener_name(listenerName);
-    const SharedBuffer buffer = writeMessageWithSize(cmd);
+    SharedBuffer buffer = writeMessageWithSize(cmd);
     cmd.clear_lookuptopic();
     return buffer;
 }
@@ -174,7 +176,7 @@ SharedBuffer Commands::newGetSchema(const std::string& topic, const std::string&
         getSchema->set_schema_version(version);
     }
 
-    const SharedBuffer buffer = writeMessageWithSize(cmd);
+    SharedBuffer buffer = writeMessageWithSize(cmd);
     cmd.clear_getschema();
     return buffer;
 }
@@ -187,12 +189,12 @@ SharedBuffer Commands::newConsumerStats(uint64_t consumerId, uint64_t requestId)
     CommandConsumerStats* consumerStats = cmd.mutable_consumerstats();
     consumerStats->set_consumer_id(consumerId);
     consumerStats->set_request_id(requestId);
-    const SharedBuffer buffer = writeMessageWithSize(cmd);
+    SharedBuffer buffer = writeMessageWithSize(cmd);
     cmd.clear_consumerstats();
     return buffer;
 }
 
-PairSharedBuffer Commands::newSend(SharedBuffer& headers, BaseCommand& cmd, ChecksumType checksumType,
+PairSharedBuffer Commands::newSend(SharedBuffer& originalHeaders, BaseCommand& cmd, ChecksumType checksumType,
                                    const SendArguments& args) {
     cmd.set_type(BaseCommand::SEND);
     CommandSend* send = cmd.mutable_send();
@@ -222,9 +224,16 @@ PairSharedBuffer Commands::newSend(SharedBuffer& headers, BaseCommand& cmd, Chec
     int totalSize = headerContentSize + payloadSize;
     int checksumReaderIndex = -1;
 
-    headers.reset();
-    assert(headers.writableBytes() >= (4 + headerContentSize));  // totalSize + headerLength
-    headers.writeUnsignedInt(totalSize);                         // External frame
+    // By default, headers refers a static buffer whose capacity is 64KB, which can be reused for headers to
+    // avoid frequent memory allocation. However, if users configure many properties, the size could be great
+    // that results a buffer overflow. In this case, we can only allocate a new larger buffer.
+    originalHeaders.reset();
+    auto headers = originalHeaders;
+    if (headers.writableBytes() < (4 /* header length */ + headerContentSize)) {
+        headers = SharedBuffer::allocate(4 + headerContentSize);
+    }
+
+    headers.writeUnsignedInt(totalSize);  // External frame
 
     // Write cmd
     headers.writeUnsignedInt(cmdSize);
@@ -278,6 +287,7 @@ SharedBuffer Commands::newConnect(const AuthenticationPtr& authentication, const
     FeatureFlags* flags = connect->mutable_feature_flags();
     flags->set_supports_auth_refresh(true);
     flags->set_supports_broker_entry_metadata(true);
+    flags->set_supports_scalable_topics(true);
     if (connectingThroughProxy) {
         Url logicalAddressUrl;
         Url::parse(logicalAddress, logicalAddressUrl);
@@ -323,12 +333,12 @@ SharedBuffer Commands::newAuthResponse(const AuthenticationPtr& authentication, 
 SharedBuffer Commands::newSubscribe(const std::string& topic, const std::string& subscription,
                                     uint64_t consumerId, uint64_t requestId, CommandSubscribe_SubType subType,
                                     const std::string& consumerName, SubscriptionMode subscriptionMode,
-                                    boost::optional<MessageId> startMessageId, bool readCompacted,
+                                    optional<MessageId> startMessageId, bool readCompacted,
                                     const std::map<std::string, std::string>& metadata,
                                     const std::map<std::string, std::string>& subscriptionProperties,
                                     const SchemaInfo& schemaInfo,
                                     CommandSubscribe_InitialPosition subscriptionInitialPosition,
-                                    bool replicateSubscriptionState, KeySharedPolicy keySharedPolicy,
+                                    bool replicateSubscriptionState, const KeySharedPolicy& keySharedPolicy,
                                     int priorityLevel) {
     BaseCommand cmd;
     cmd.set_type(BaseCommand::SUBSCRIBE);
@@ -410,7 +420,7 @@ SharedBuffer Commands::newProducer(const std::string& topic, uint64_t producerId
                                    const std::map<std::string, std::string>& metadata,
                                    const SchemaInfo& schemaInfo, uint64_t epoch,
                                    bool userProvidedProducerName, bool encrypted,
-                                   ProducerAccessMode accessMode, boost::optional<uint64_t> topicEpoch,
+                                   ProducerAccessMode accessMode, optional<uint64_t> topicEpoch,
                                    const std::string& initialSubscriptionName) {
     BaseCommand cmd;
     cmd.set_type(BaseCommand::PRODUCER);
@@ -545,6 +555,24 @@ SharedBuffer Commands::newCloseConsumer(uint64_t consumerId, uint64_t requestId)
     return writeMessageWithSize(cmd);
 }
 
+SharedBuffer Commands::newScalableTopicLookup(uint64_t sessionId, const std::string& topic,
+                                              bool createIfMissing) {
+    BaseCommand cmd;
+    cmd.set_type(BaseCommand::SCALABLE_TOPIC_LOOKUP);
+    CommandScalableTopicLookup* lookup = cmd.mutable_scalabletopiclookup();
+    lookup->set_session_id(sessionId);
+    lookup->set_topic(topic);
+    lookup->set_create_if_missing(createIfMissing);
+    return writeMessageWithSize(cmd);
+}
+
+SharedBuffer Commands::newScalableTopicClose(uint64_t sessionId) {
+    BaseCommand cmd;
+    cmd.set_type(BaseCommand::SCALABLE_TOPIC_CLOSE);
+    cmd.mutable_scalabletopicclose()->set_session_id(sessionId);
+    return writeMessageWithSize(cmd);
+}
+
 SharedBuffer Commands::newPing() {
     BaseCommand cmd;
     cmd.set_type(BaseCommand::PING);
@@ -612,7 +640,7 @@ SharedBuffer Commands::newGetLastMessageId(uint64_t consumerId, uint64_t request
     CommandGetLastMessageId* getLastMessageId = cmd.mutable_getlastmessageid();
     getLastMessageId->set_consumer_id(consumerId);
     getLastMessageId->set_request_id(requestId);
-    const SharedBuffer buffer = writeMessageWithSize(cmd);
+    SharedBuffer buffer = writeMessageWithSize(cmd);
     cmd.clear_getlastmessageid();
     return buffer;
 }
@@ -626,7 +654,7 @@ SharedBuffer Commands::newGetTopicsOfNamespace(const std::string& nsName,
     getTopics->set_namespace_(nsName);
     getTopics->set_mode(static_cast<proto::CommandGetTopicsOfNamespace_Mode>(mode));
 
-    const SharedBuffer buffer = writeMessageWithSize(cmd);
+    SharedBuffer buffer = writeMessageWithSize(cmd);
     cmd.clear_gettopicsofnamespace();
     return buffer;
 }
@@ -801,6 +829,42 @@ std::string Commands::messageType(BaseCommand_Type type) {
         case BaseCommand::WATCH_TOPIC_LIST_CLOSE:
             return "WATCH_TOPIC_LIST_CLOSE";
             break;
+        case BaseCommand::SCALABLE_TOPIC_LOOKUP:
+            return "SCALABLE_TOPIC_LOOKUP";
+            break;
+        case BaseCommand::SCALABLE_TOPIC_UPDATE:
+            return "SCALABLE_TOPIC_UPDATE";
+            break;
+        case BaseCommand::SCALABLE_TOPIC_CLOSE:
+            return "SCALABLE_TOPIC_CLOSE";
+            break;
+        case BaseCommand::SCALABLE_TOPIC_SUBSCRIBE:
+            return "SCALABLE_TOPIC_SUBSCRIBE";
+            break;
+        case BaseCommand::SCALABLE_TOPIC_SUBSCRIBE_RESPONSE:
+            return "SCALABLE_TOPIC_SUBSCRIBE_RESPONSE";
+            break;
+        case BaseCommand::SCALABLE_TOPIC_ASSIGNMENT_UPDATE:
+            return "SCALABLE_TOPIC_ASSIGNMENT_UPDATE";
+            break;
+        case BaseCommand::WATCH_SCALABLE_TOPICS:
+            return "WATCH_SCALABLE_TOPICS";
+            break;
+        case BaseCommand::WATCH_SCALABLE_TOPICS_UPDATE:
+            return "WATCH_SCALABLE_TOPICS_UPDATE";
+            break;
+        case BaseCommand::WATCH_SCALABLE_TOPICS_CLOSE:
+            return "WATCH_SCALABLE_TOPICS_CLOSE";
+            break;
+        case BaseCommand::WATCH_TC_ASSIGNMENTS:
+            return "WATCH_TC_ASSIGNMENTS";
+            break;
+        case BaseCommand::WATCH_TC_ASSIGNMENTS_UPDATE:
+            return "WATCH_TC_ASSIGNMENTS_UPDATE";
+            break;
+        case BaseCommand::WATCH_TC_ASSIGNMENTS_CLOSE:
+            return "WATCH_TC_ASSIGNMENTS_CLOSE";
+            break;
     };
     BOOST_THROW_EXCEPTION(std::logic_error("Invalid BaseCommand enumeration value"));
 }
@@ -864,6 +928,10 @@ static std::pair<std::unique_ptr<char[]>, size_t> serializeSingleMessageMetadata
         metadata.set_sequence_id(msgMetadata.sequence_id());
     }
 
+    if (msgMetadata.null_value()) {
+        metadata.set_null_value(true);
+    }
+
     size_t size = metadata.ByteSizeLong();
     std::unique_ptr<char[]> data{new char[size]};
     metadata.SerializeToArray(data.get(), size);
@@ -895,7 +963,9 @@ uint64_t Commands::serializeSingleMessagesToBatchPayload(SharedBuffer& batchPayl
         batchPayload.write(payload.data(), payload.readableBytes());
     }
 
-    return messages.back().impl_->metadata.sequence_id();
+    // Use the first message's sequence_id so that ackReceived can compute
+    // lastSequenceIdPublished_ = sequenceId + messagesCount - 1 correctly.
+    return messages.front().impl_->metadata.sequence_id();
 }
 
 bool Commands::isValidBatchPayload(const SharedBuffer& batchPayload, int32_t batchSize) {
@@ -965,6 +1035,7 @@ Message Commands::deSerializeSingleMessageInBatch(Message& batchedMessage, int32
                           batchedMessage.impl_->metadata, payload, metadata,
                           batchedMessage.impl_->topicName_);
     singleMessage.impl_->cnx_ = batchedMessage.impl_->cnx_;
+    singleMessage.impl_->encryptionContext_ = batchedMessage.impl_->encryptionContext_;
 
     return singleMessage;
 }

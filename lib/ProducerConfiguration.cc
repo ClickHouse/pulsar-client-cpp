@@ -38,7 +38,7 @@ ProducerConfiguration& ProducerConfiguration::operator=(const ProducerConfigurat
 }
 
 ProducerConfiguration& ProducerConfiguration::setProducerName(const std::string& producerName) {
-    impl_->producerName = boost::make_optional(producerName);
+    impl_->producerName = std::make_optional(producerName);
     return *this;
 }
 
@@ -47,7 +47,7 @@ const std::string& ProducerConfiguration::getProducerName() const {
 }
 
 ProducerConfiguration& ProducerConfiguration::setInitialSequenceId(int64_t initialSequenceId) {
-    impl_->initialSequenceId = boost::make_optional(initialSequenceId);
+    impl_->initialSequenceId = std::make_optional(initialSequenceId);
     return *this;
 }
 
@@ -180,7 +180,7 @@ ProducerConfiguration::BatchingType ProducerConfiguration::getBatchingType() con
 const CryptoKeyReaderPtr ProducerConfiguration::getCryptoKeyReader() const { return impl_->cryptoKeyReader; }
 
 ProducerConfiguration& ProducerConfiguration::setCryptoKeyReader(CryptoKeyReaderPtr cryptoKeyReader) {
-    impl_->cryptoKeyReader = cryptoKeyReader;
+    impl_->cryptoKeyReader = std::move(cryptoKeyReader);
     return *this;
 }
 
@@ -201,7 +201,7 @@ bool ProducerConfiguration::isEncryptionEnabled() const {
     return (!impl_->encryptionKeys.empty() && (impl_->cryptoKeyReader != NULL));
 }
 
-ProducerConfiguration& ProducerConfiguration::addEncryptionKey(std::string key) {
+ProducerConfiguration& ProducerConfiguration::addEncryptionKey(const std::string& key) {
     impl_->encryptionKeys.insert(key);
     return *this;
 }

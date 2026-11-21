@@ -19,10 +19,12 @@
 #ifndef MESSAGE_HPP_
 #define MESSAGE_HPP_
 
+#include <pulsar/EncryptionContext.h>
 #include <pulsar/defines.h>
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "KeyValue.h"
@@ -158,6 +160,17 @@ class PULSAR_PUBLIC Message {
     bool hasOrderingKey() const;
 
     /**
+     * Check if the message has a null value.
+     *
+     * Messages with null values are used as tombstones on compacted topics
+     * to delete the message for a specific key.
+     *
+     * @return true if the message has a null value (tombstone)
+     *         false if the message has actual payload data
+     */
+    bool hasNullValue() const;
+
+    /**
      * Get the UTC based timestamp in milliseconds referring to when the message was published by the client
      * producer
      */
@@ -187,7 +200,7 @@ class PULSAR_PUBLIC Message {
     /**
      * Get the redelivery count for this message
      */
-    const int getRedeliveryCount() const;
+    int getRedeliveryCount() const;
 
     /**
      * Check if schema version exists
@@ -205,6 +218,32 @@ class PULSAR_PUBLIC Message {
      * Get the schema version of the raw bytes.
      */
     const std::string& getSchemaVersion() const;
+
+    /**
+     * Set the schema version of the message.
+     */
+    void setSchemaVersion(const std::string& schemaVersion);
+
+    /**
+     * Get the producer name which produced this message.
+     *
+     * @return the producer name or empty string if not available
+     */
+    const std::string& getProducerName() const noexcept;
+
+    /**
+     * Get the source cluster from which the message was replicated.
+     *
+     * @return the optional pointer to the source cluster name if the message was replicated, the pointer is
+     * valid as the Message instance is alive
+     */
+    std::optional<const std::string*> getReplicatedFrom() const;
+
+    /**
+     * @return the optional encryption context that is present when the message is encrypted, the pointer is
+     * valid as the Message instance is alive
+     */
+    std::optional<const EncryptionContext*> getEncryptionContext() const;
 
     bool operator==(const Message& msg) const;
 

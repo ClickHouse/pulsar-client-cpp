@@ -123,6 +123,12 @@ Message::Message(const MessageId& messageID, proto::BrokerEntryMetadata& brokerE
     } else {
         impl_->metadata.clear_sequence_id();
     }
+
+    if (singleMetadata.null_value()) {
+        impl_->metadata.set_null_value(true);
+    } else {
+        impl_->metadata.clear_null_value();
+    }
 }
 
 const MessageId& Message::getMessageId() const {
@@ -177,6 +183,13 @@ const std::string& Message::getOrderingKey() const {
     return impl_->getOrderingKey();
 }
 
+bool Message::hasNullValue() const {
+    if (impl_) {
+        return impl_->metadata.null_value();
+    }
+    return false;
+}
+
 const std::string& Message::getTopicName() const {
     if (!impl_) {
         return emptyString;
@@ -184,7 +197,7 @@ const std::string& Message::getTopicName() const {
     return impl_->getTopicName();
 }
 
-const int Message::getRedeliveryCount() const {
+int Message::getRedeliveryCount() const {
     if (!impl_) {
         return 0;
     }
@@ -209,11 +222,38 @@ const std::string& Message::getSchemaVersion() const {
     return impl_->getSchemaVersion();
 }
 
+void Message::setSchemaVersion(const std::string& schemaVersion) {
+    if (impl_) {
+        impl_->metadata.set_schema_version(schemaVersion);
+    }
+}
+
 uint64_t Message::getPublishTimestamp() const { return impl_ ? impl_->getPublishTimestamp() : 0ull; }
 
 uint64_t Message::getEventTimestamp() const { return impl_ ? impl_->getEventTimestamp() : 0ull; }
 
 bool Message::hasEventTimestamp() const { return impl_ ? impl_->hasEventTimestamp() : false; }
+
+const std::string& Message::getProducerName() const noexcept {
+    if (!impl_) {
+        return emptyString;
+    }
+    return impl_->metadata.producer_name();
+}
+
+std::optional<const std::string*> Message::getReplicatedFrom() const {
+    if (!impl_ || !impl_->metadata.has_replicated_from()) {
+        return std::nullopt;
+    }
+    return &impl_->metadata.replicated_from();
+}
+
+std::optional<const EncryptionContext*> Message::getEncryptionContext() const {
+    if (!impl_ || !impl_->encryptionContext_.has_value()) {
+        return std::nullopt;
+    }
+    return &impl_->encryptionContext_.value();
+}
 
 bool Message::operator==(const Message& msg) const { return getMessageId() == msg.getMessageId(); }
 

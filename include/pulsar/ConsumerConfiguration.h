@@ -117,7 +117,7 @@ class PULSAR_PUBLIC ConsumerConfiguration {
      *
      * @param keySharedPolicy The {@link KeySharedPolicy} want to specify
      */
-    ConsumerConfiguration& setKeySharedPolicy(KeySharedPolicy keySharedPolicy);
+    ConsumerConfiguration& setKeySharedPolicy(const KeySharedPolicy& keySharedPolicy);
 
     /**
      * @return the KeyShared subscription policy
@@ -276,6 +276,21 @@ class PULSAR_PUBLIC ConsumerConfiguration {
      * @return redelivery delay for failed messages
      */
     long getNegativeAckRedeliveryDelayMs() const;
+
+    /**
+     * Set the precision bit count for negative ack redelivery delay.
+     * The lower bits of the redelivery time will be trimmed to reduce the memory occupation.
+     * @param negativeAckPrecisionBitCnt
+     *            negative ack precision bit count
+     */
+    void setNegativeAckPrecisionBitCnt(int negativeAckPrecisionBitCnt);
+
+    /**
+     * Get the configured precision bit count for negative ack redelivery delay.
+     *
+     * @return redelivery time precision bit count
+     */
+    int getNegativeAckPrecisionBitCnt() const;
 
     /**
      * Set time window in milliseconds for grouping message ACK requests. An ACK request is not sent

@@ -18,9 +18,6 @@
  */
 #include "ConsumerImplBase.h"
 
-#include <algorithm>
-
-#include "ConsumerImpl.h"
 #include "ExecutorService.h"
 #include "LogUtils.h"
 #include "TimeUtils.h"
@@ -29,13 +26,14 @@ DECLARE_LOG_OBJECT()
 
 namespace pulsar {
 
-ConsumerImplBase::ConsumerImplBase(ClientImplPtr client, const std::string& topic, Backoff backoff,
-                                   const ConsumerConfiguration& conf, ExecutorServicePtr listenerExecutor)
+ConsumerImplBase::ConsumerImplBase(const ClientImplPtr& client, const std::string& topic, Backoff backoff,
+                                   const ConsumerConfiguration& conf,
+                                   const ExecutorServicePtr& listenerExecutor)
     : HandlerBase(client, topic, backoff),
       listenerExecutor_(listenerExecutor),
       batchReceivePolicy_(conf.getBatchReceivePolicy()),
       consumerName_(conf.getConsumerName()) {
-    auto userBatchReceivePolicy = conf.getBatchReceivePolicy();
+    const auto& userBatchReceivePolicy = conf.getBatchReceivePolicy();
     if (userBatchReceivePolicy.getMaxNumMessages() > conf.getReceiverQueueSize()) {
         batchReceivePolicy_ =
             BatchReceivePolicy(conf.getReceiverQueueSize(), userBatchReceivePolicy.getMaxNumBytes(),
@@ -51,12 +49,11 @@ ConsumerImplBase::ConsumerImplBase(ClientImplPtr client, const std::string& topi
 
 void ConsumerImplBase::triggerBatchReceiveTimerTask(long timeoutMs) {
     if (timeoutMs > 0) {
-        batchReceiveTimer_->expires_from_now(std::chrono::milliseconds(timeoutMs));
-        std::weak_ptr<ConsumerImplBase> weakSelf{shared_from_this()};
+        batchReceiveTimer_->expires_after(std::chrono::milliseconds(timeoutMs));
+        auto weakSelf = weak_from_this();
         batchReceiveTimer_->async_wait([weakSelf](const ASIO_ERROR& ec) {
-            auto self = weakSelf.lock();
-            if (self && !ec) {
-                self->doBatchReceiveTimeTask();
+            if (auto self = weakSelf.lock(); self && !ec) {
+                std::static_pointer_cast<ConsumerImplBase>(self)->doBatchReceiveTimeTask();
             }
         });
     }
@@ -107,7 +104,7 @@ void ConsumerImplBase::notifyBatchPendingReceivedCallback() {
     }
 }
 
-void ConsumerImplBase::batchReceiveAsync(BatchReceiveCallback callback) {
+void ConsumerImplBase::batchReceiveAsync(const BatchReceiveCallback& callback) {
     // fail the callback if consumer is closing or closed
     if (state_ != Ready) {
         callback(ResultAlreadyClosed, Messages());

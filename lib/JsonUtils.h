@@ -18,30 +18,17 @@
  */
 #pragma once
 
-#include <mutex>
+#include <boost/property_tree/json_parser.hpp>
+#include <sstream>
+#include <string>
 
-template <typename T>
-class Synchronized {
-   public:
-    explicit Synchronized(const T& value) : value_(value) {}
+namespace pulsar {
 
-    T get() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return value_;
-    }
+template <typename Ptree>
+inline std::string toJson(const Ptree& pt) {
+    std::ostringstream oss;
+    boost::property_tree::write_json(oss, pt, false);
+    return oss.str();
+}
 
-    T&& release() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return std::move(value_);
-    }
-
-    Synchronized& operator=(const T& value) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        value_ = value;
-        return *this;
-    }
-
-   private:
-    T value_;
-    mutable std::mutex mutex_;
-};
+}  // namespace pulsar

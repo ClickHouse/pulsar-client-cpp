@@ -41,6 +41,7 @@ else ()
     set(PULSAR_SOURCES ${PULSAR_SOURCES} ${PROTO_SOURCES})
     ADD_CUSTOM_COMMAND(
              OUTPUT ${PROTO_SOURCES}
+             COMMAND ${CMAKE_COMMAND} -E echo "Generating PulsarApi.pb.cc/h with: ${PROTOC_PATH} -I ../proto ../proto/PulsarApi.proto --cpp_out=${LIB_AUTOGEN_DIR}"
              COMMAND ${PROTOC_PATH} -I ../proto ../proto/PulsarApi.proto --cpp_out=${LIB_AUTOGEN_DIR}
              DEPENDS
              ../proto/PulsarApi.proto
@@ -76,8 +77,37 @@ target_include_directories(PULSAR_OBJECT_LIB PUBLIC
     "${CMAKE_SOURCE_DIR}/include"
     "${CMAKE_BINARY_DIR}/include")
 
+# --- Scalable topics (pulsar::st) implementation ----------------------------
+# The st API (include/pulsar/st) targets C++20 while the classic client above
+# stays C++17, so its implementation compiles in a separate object library with
+# a per-target standard. The objects are merged into the same libpulsar
+# shared/static artifacts below; a C++20-compiled object archive links fine
+# into C++17 consumers of the classic API.
+file(GLOB PULSAR_ST_SOURCES st/*.cc st/*.h)
+add_library(ST_OBJECT_LIB OBJECT ${PULSAR_ST_SOURCES})
+set_property(TARGET ST_OBJECT_LIB PROPERTY POSITION_INDEPENDENT_CODE 1)
+set_target_properties(ST_OBJECT_LIB PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+if (INTEGRATE_VCPKG)
+    target_link_libraries(ST_OBJECT_LIB PROTO_OBJECTS)
+    # The st sources #include the generated PulsarApi.pb.h. Linking PROTO_OBJECTS
+    # propagates its include dir, but the OBJECT->OBJECT link does not reliably
+    # order the build under the Visual Studio generator, so the st sources can
+    # compile before the proto is generated. Force the ordering explicitly.
+    add_dependencies(ST_OBJECT_LIB PROTO_OBJECTS)
+else ()
+    # Legacy (non-vcpkg) build generates the proto as part of PULSAR_OBJECT_LIB;
+    # ensure it exists before the st sources that include it compile.
+    add_dependencies(ST_OBJECT_LIB PULSAR_OBJECT_LIB)
+endif ()
+target_include_directories(ST_OBJECT_LIB PRIVATE ${LIB_AUTOGEN_DIR})
+target_include_directories(ST_OBJECT_LIB PUBLIC
+    "${CMAKE_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_BINARY_DIR}/include")
+
+include(CheckCXXSymbolExists)
 if (BUILD_DYNAMIC_LIB)
-    add_library(pulsarShared SHARED $<TARGET_OBJECTS:PULSAR_OBJECT_LIB>)
+    add_library(pulsarShared SHARED $<TARGET_OBJECTS:PULSAR_OBJECT_LIB> $<TARGET_OBJECTS:ST_OBJECT_LIB>)
     set_property(TARGET pulsarShared PROPERTY OUTPUT_NAME ${LIB_NAME_SHARED})
     set_property(TARGET pulsarShared PROPERTY VERSION ${LIBRARY_VERSION})
     target_link_libraries(pulsarShared PRIVATE ${COMMON_LIBS} ${CMAKE_DL_LIBS})
@@ -89,16 +119,18 @@ if (BUILD_DYNAMIC_LIB)
         target_include_directories(pulsarShared PRIVATE ${dlfcn-win32_INCLUDE_DIRS})
         target_link_options(pulsarShared PRIVATE $<$<CONFIG:DEBUG>:/NODEFAULTLIB:MSVCRT>)
     endif()
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_link_options(pulsarShared PRIVATE -Wl,-Bsymbolic)
+    endif ()
 endif()
 
-include(CheckCXXSymbolExists)
 check_cxx_symbol_exists(getauxval sys/auxv.h HAVE_AUXV_GETAUXVAL)
 if(HAVE_AUXV_GETAUXVAL)
     add_definitions(-DPULSAR_AUXV_GETAUXVAL_PRESENT)
 endif()
 
 if (BUILD_STATIC_LIB)
-    add_library(pulsarStatic STATIC $<TARGET_OBJECTS:PULSAR_OBJECT_LIB>)
+    add_library(pulsarStatic STATIC $<TARGET_OBJECTS:PULSAR_OBJECT_LIB> $<TARGET_OBJECTS:ST_OBJECT_LIB>)
     target_include_directories(pulsarStatic PUBLIC
         ${CMAKE_BINARY_DIR}/include
         ${CMAKE_SOURCE_DIR}
@@ -135,14 +167,61 @@ if (LINK_STATIC AND BUILD_STATIC_LIB)
             set(${OUTLIST} ${TEMP_OUT} PARENT_SCOPE)
         endfunction(remove_libtype)
 
-        add_library(pulsarStaticWithDeps STATIC ${PULSAR_SOURCES})
+        add_library(pulsarStaticWithDeps STATIC ${PULSAR_SOURCES} $<TARGET_OBJECTS:ST_OBJECT_LIB>)
         target_include_directories(pulsarStaticWithDeps PRIVATE ${dlfcn-win32_INCLUDE_DIRS})
-        if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-            remove_libtype("${COMMON_LIBS}" "optimized" STATIC_LIBS)
+        if (VCPKG_TRIPLET)
+            # Collect ALL vcpkg-installed static archives so every transitive dependency
+            # (protobuf, abseil, curl, zlib, etc.) is merged into the fat lib without
+            # requiring manual enumeration of individual targets.
+            set(_vcpkg_dir "${PROJECT_SOURCE_DIR}/vcpkg_installed/${VCPKG_TRIPLET}")
+            file(GLOB _release_libs "${_vcpkg_dir}/lib/*.lib")
+            file(GLOB _debug_libs   "${_vcpkg_dir}/debug/lib/*.lib")
+            # Exclude the protobuf compiler tool and lite runtime (not needed at runtime)
+            foreach (_excl "libprotoc" "libprotobuf-lite")
+                list(FILTER _release_libs EXCLUDE REGEX "/${_excl}\\.lib$")
+                list(FILTER _debug_libs   EXCLUDE REGEX "/${_excl}\\.lib$")
+            endforeach ()
+            # Build per-lib generator expressions to select debug vs release archive
+            # for multi-config generators (Visual Studio).
+            set(_vcpkg_static_libs "")
+            foreach (_rlib IN LISTS _release_libs)
+                get_filename_component(_libname "${_rlib}" NAME)
+                set(_dlib "${_vcpkg_dir}/debug/lib/${_libname}")
+                if (EXISTS "${_dlib}")
+                    list(APPEND _vcpkg_static_libs "$<IF:$<CONFIG:Debug>,${_dlib},${_rlib}>")
+                else ()
+                    list(APPEND _vcpkg_static_libs "${_rlib}")
+                endif ()
+            endforeach ()
+            # Also merge Windows system DLL import libs so pulsarWithDeps.lib is fully
+            # self-contained. lib.exe carries the import records into the archive; the
+            # final linker then resolves DLL deps without the user listing them.
+            # lib.exe finds these by name via the LIB env var set up by MSBuild/MSVC.
+            list(APPEND _vcpkg_static_libs
+                ws2_32.lib crypt32.lib wldap32.lib Normaliz.lib iphlpapi.lib)
+            set_property(TARGET pulsarStaticWithDeps PROPERTY STATIC_LIBRARY_OPTIONS ${_vcpkg_static_libs})
         else ()
-            remove_libtype("${COMMON_LIBS}" "debug" STATIC_LIBS)
+            # Non-vcpkg MSVC static build: resolve COMMON_LIBS entries for lib.exe.
+            # CMake imported target names cannot be passed to lib.exe directly; replace
+            # them with $<TARGET_FILE:...> generator expressions.
+            if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+                remove_libtype("${COMMON_LIBS}" "optimized" STATIC_LIBS)
+            else ()
+                remove_libtype("${COMMON_LIBS}" "debug" STATIC_LIBS)
+            endif ()
+            set(RESOLVED_STATIC_LIBS "")
+            foreach (LIB IN LISTS STATIC_LIBS)
+                if (TARGET ${LIB})
+                    get_target_property(_LIB_TYPE ${LIB} TYPE)
+                    if (_LIB_TYPE STREQUAL "STATIC_LIBRARY" OR _LIB_TYPE STREQUAL "UNKNOWN_LIBRARY")
+                        list(APPEND RESOLVED_STATIC_LIBS "$<TARGET_FILE:${LIB}>")
+                    endif ()
+                elseif (IS_ABSOLUTE "${LIB}" AND LIB MATCHES "\\.(lib|a)$")
+                    list(APPEND RESOLVED_STATIC_LIBS "${LIB}")
+                endif ()
+            endforeach ()
+            set_property(TARGET pulsarStaticWithDeps PROPERTY STATIC_LIBRARY_OPTIONS ${RESOLVED_STATIC_LIBS})
         endif ()
-        set_property(TARGET pulsarStaticWithDeps PROPERTY STATIC_LIBRARY_OPTIONS ${STATIC_LIBS})
         set_property(TARGET pulsarStaticWithDeps PROPERTY OUTPUT_NAME ${LIB_NAME}WithDeps)
         set_property(TARGET pulsarStaticWithDeps PROPERTY VERSION ${LIBRARY_VERSION})
         install(TARGETS pulsarStaticWithDeps DESTINATION lib)

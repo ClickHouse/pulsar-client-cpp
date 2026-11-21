@@ -21,9 +21,11 @@
 
 #include <pulsar/ClientConfiguration.h>
 #include <pulsar/Result.h>
+#include <pulsar/ServiceInfo.h>
 #include <pulsar/defines.h>
 
 #include <atomic>
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -31,6 +33,7 @@
 #include <string>
 
 #include "Future.h"
+#include "lib/AtomicSharedPtr.h"
 namespace pulsar {
 
 class ClientConnection;
@@ -41,8 +44,8 @@ using ExecutorServiceProviderPtr = std::shared_ptr<ExecutorServiceProvider>;
 
 class PULSAR_PUBLIC ConnectionPool {
    public:
-    ConnectionPool(const ClientConfiguration& conf, ExecutorServiceProviderPtr executorProvider,
-                   const AuthenticationPtr& authentication, const std::string& clientVersion);
+    ConnectionPool(const AtomicSharedPtr<ServiceInfo>& serviceInfo, const ClientConfiguration& conf,
+                   const ExecutorServiceProviderPtr& executorProvider, const std::string& clientVersion);
 
     /**
      * Close the connection pool.
@@ -50,6 +53,12 @@ class PULSAR_PUBLIC ConnectionPool {
      * @return false if it has already been closed.
      */
     bool close();
+
+    /**
+     * Close all existing connections and notify the connection that a new cluster will be used.
+     * Unlike close(), the pool remains open for new connections.
+     */
+    void closeAllConnectionsForNewCluster();
 
     void remove(const std::string& logicalAddress, const std::string& physicalAddress, size_t keySuffix,
                 ClientConnection* value);
@@ -74,16 +83,16 @@ class PULSAR_PUBLIC ConnectionPool {
      * @param keySuffix the key suffix to choose which connection on the same broker
      * @return a future that will produce the ClientCnx object
      */
-    Future<Result, ClientConnectionWeakPtr> getConnectionAsync(const std::string& logicalAddress,
-                                                               const std::string& physicalAddress,
-                                                               size_t keySuffix);
+    Future<Error, ClientConnectionWeakPtr> getConnectionAsync(const std::string& logicalAddress,
+                                                              const std::string& physicalAddress,
+                                                              size_t keySuffix);
 
-    Future<Result, ClientConnectionWeakPtr> getConnectionAsync(const std::string& logicalAddress,
-                                                               const std::string& physicalAddress) {
+    Future<Error, ClientConnectionWeakPtr> getConnectionAsync(const std::string& logicalAddress,
+                                                              const std::string& physicalAddress) {
         return getConnectionAsync(logicalAddress, physicalAddress, generateRandomIndex());
     }
 
-    Future<Result, ClientConnectionWeakPtr> getConnectionAsync(const std::string& address) {
+    Future<Error, ClientConnectionWeakPtr> getConnectionAsync(const std::string& address) {
         return getConnectionAsync(address, address);
     }
 
@@ -94,9 +103,9 @@ class PULSAR_PUBLIC ConnectionPool {
     }
 
    private:
+    const AtomicSharedPtr<ServiceInfo>& serviceInfo_;
     ClientConfiguration clientConfiguration_;
     ExecutorServiceProviderPtr executorProvider_;
-    AuthenticationPtr authentication_;
     typedef std::map<std::string, std::shared_ptr<ClientConnection>> PoolMap;
     PoolMap pool_;
     const std::string clientVersion_;
@@ -106,6 +115,13 @@ class PULSAR_PUBLIC ConnectionPool {
     std::uniform_int_distribution<> randomDistribution_;
     std::mt19937 randomEngine_;
     std::mutex randomMutex_;
+
+    auto releaseConnections() {
+        decltype(pool_) pool;
+        std::lock_guard lock{mutex_};
+        pool.swap(pool_);
+        return pool;
+    }
 
     friend class PulsarFriend;
 };

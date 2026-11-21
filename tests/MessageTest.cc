@@ -22,6 +22,7 @@
 
 #include <string>
 
+#include "PulsarFriend.h"
 #include "lib/MessageImpl.h"
 
 using namespace pulsar;
@@ -42,6 +43,7 @@ TEST(MessageTest, testMessageContents) {
     ASSERT_NE(myContents.c_str(), (char*)msg.getData());
     ASSERT_EQ(myContents, msg.getDataAsString());
     ASSERT_EQ(std::string("mycontents").length(), msg.getLength());
+    ASSERT_TRUE(msg.getProducerName().empty());
 }
 
 TEST(MessageTest, testAllocatedContents) {
@@ -146,4 +148,63 @@ TEST(MessageTest, testMessageImplKeyValuePayloadCovert) {
         ASSERT_EQ(deMsgImpl.keyValuePtr->getKey(), "");
         ASSERT_EQ(deMsgImpl.keyValuePtr->getValueAsString(), valueContent);
     }
+}
+
+TEST(MessageTest, testGetTopicNameOnProducerMessage) {
+    auto msg = MessageBuilder().setContent("test").build();
+    ASSERT_TRUE(msg.getTopicName().empty());
+}
+
+TEST(MessageTest, testReplicationMetadataAccessors) {
+    auto msg = MessageBuilder().setContent("test").build();
+    ASSERT_FALSE(msg.getReplicatedFrom().has_value());
+
+    PulsarFriend::getMessageMetadata(msg).set_replicated_from("us-west1");
+
+    const auto replicatedFrom = msg.getReplicatedFrom();
+    ASSERT_TRUE(replicatedFrom.has_value());
+    ASSERT_EQ(*replicatedFrom.value(), "us-west1");
+}
+
+TEST(MessageTest, testNullValueMessage) {
+    {
+        auto msg = MessageBuilder().setContent("test").build();
+        ASSERT_FALSE(msg.hasNullValue());
+    }
+
+    {
+        auto msg = MessageBuilder().setNullValue().setPartitionKey("key1").build();
+        ASSERT_TRUE(msg.hasNullValue());
+        ASSERT_EQ(msg.getLength(), 0);
+        ASSERT_EQ(msg.getPartitionKey(), "key1");
+    }
+
+    {
+        auto msg = MessageBuilder().setPartitionKey("key2").setNullValue().build();
+        ASSERT_TRUE(msg.hasNullValue());
+        ASSERT_EQ(msg.getPartitionKey(), "key2");
+    }
+}
+
+TEST(MessageTest, testEmptyMessage) {
+    auto msg = MessageBuilder().build();
+    ASSERT_FALSE(msg.hasNullValue());
+    ASSERT_EQ(msg.getLength(), 0);
+}
+
+TEST(MessageTest, testEmptyStringNotNullValue) {
+    // Empty string message - has content set to ""
+    auto emptyStringMsg = MessageBuilder().setContent("").build();
+    ASSERT_FALSE(emptyStringMsg.hasNullValue());
+    ASSERT_EQ(emptyStringMsg.getLength(), 0);
+    ASSERT_EQ(emptyStringMsg.getDataAsString(), "");
+
+    // Null value message - explicitly marked as null
+    auto nullValueMsg = MessageBuilder().setNullValue().setPartitionKey("key").build();
+    ASSERT_TRUE(nullValueMsg.hasNullValue());
+    ASSERT_EQ(nullValueMsg.getLength(), 0);
+
+    // Both have length 0, but they are semantically different
+    // Empty string: the value IS an empty string
+    // Null value: the value does not exist (tombstone for compaction)
 }
